@@ -1,0 +1,10 @@
+# 运行时产物（按天产生，不入库）
+_research/
+logs/
+state/
+
+# 本地错误处理实现（复制自 errorHandler.example.mjs，含本机命令）
+errorHandler.mjs
+
+# Node
+node_modules/
