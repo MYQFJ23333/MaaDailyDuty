@@ -56,8 +56,8 @@ const DEFAULT_CONFIG = {
     maaLog: 'D:\\Program Files\\MAA\\debug\\gui.log',
     maaendExe: 'D:\\Program Files\\MaaEnd\\MaaEnd.exe',
   },
-  watchdogSec: 1800,          // 判定通过后挂载的兜底关机（30 分钟）
-  monitorTimeoutSec: 1500,    // 监测总时限；启动时会按预算链自动 clamp（ready+monitor+2×onError+60s < watchdogSec）
+  watchdogSec: 2100,          // 判定通过后挂载的兜底关机（35 分钟 = 游戏3 + 就绪2 + 监测25 + 错误2×1 + 余量1 + 缓冲2）
+  monitorTimeoutSec: 1380,    // 监测总时限；启动时会按预算链自动 clamp（ready+gameReady+monitor+2×onError+60s ≤ watchdogSec）
   readyTimeoutSec: 120,       // 两进程启动就绪上限
   maaReadyStableSec: 5,       // MAA 进程持续存活多久算启动成功
   shutdownGraceSec: 5,        // 关机前宽限（>0 时 shutdown 自动隐含 /f）
@@ -70,10 +70,18 @@ const DEFAULT_CONFIG = {
     portScan: [12701, 12702, 12703, 12704, 12705, 12706, 12707, 12708, 12709, 12710],
     wsEnabled: true,           // WebSocket tasks-completed 事件加速
   },
+  game: {
+    // 终末地 1.6+：U8SDK 校验 Endfield.exe 的父进程必须是官方 Games.exe，直启会弹「请通过官方启动器打开游戏」。
+    // 由计划任务（管理员权限）运行 launch-endfield.ps1：挂起创建官方 Games.exe 作父进程再拉起游戏。
+    // 计划任务注册需一次性管理员授权（schtasks /Create /RL HIGHEST）；日常触发 schtasks /Run 无需提权。
+    enabled: true,
+    taskName: 'DawnDutyLaunchGame', // 触发游戏启动的计划任务名
+    readyTimeoutSec: 180,           // 触发后等待游戏窗口就绪上限（含提权脚本编译与游戏本体启动耗时）
+  },
   onError: {
     command: '',               // 例如 "powershell" args: ["-File", "C:\\...\\my-alert.ps1"]
     args: [],
-    timeoutSec: 60,
+    timeoutSec: 30,            // 错误处理脚本单次执行上限（预算链内占 2×）
   },
 }
 
@@ -105,7 +113,7 @@ function coerceSection(c, key, quiet = false) {
 function validateConfig(c, quiet = false) {
   const W = (msg) => { if (!quiet) log('WARN', 'config', msg) }
   const E = (msg) => { if (!quiet) log('ERROR', 'config', msg) }
-  for (const k of ['window', 'paths', 'maa', 'maend', 'onError']) coerceSection(c, k, quiet)
+  for (const k of ['window', 'paths', 'maa', 'maend', 'game', 'onError']) coerceSection(c, k, quiet)
   if (!Array.isArray(c.maend.portScan) || c.maend.portScan.length === 0 ||
       c.maend.portScan.some(p => !Number.isInteger(p) || p < 1 || p > 65535)) {
     W(`maend.portScan=${JSON.stringify(c.maend.portScan)} 非法（须为非空端口数组），回退默认 12701-12710`)
@@ -113,6 +121,8 @@ function validateConfig(c, quiet = false) {
   }
   if (typeof c.onError.command !== 'string') { W('onError.command 不是字符串，置空'); c.onError.command = '' }
   if (!Array.isArray(c.onError.args)) { W(`onError.args=${JSON.stringify(c.onError.args)} 不是数组，置空`); c.onError.args = [] }
+  if (typeof c.game.enabled !== 'boolean') { W(`game.enabled=${JSON.stringify(c.game.enabled)} 非法，回退默认 true`); c.game.enabled = DEFAULT_CONFIG.game.enabled }
+  if (typeof c.game.taskName !== 'string' || !c.game.taskName.trim()) { W('game.taskName 非法（须为非空字符串），回退默认 DawnDutyLaunchGame'); c.game.taskName = DEFAULT_CONFIG.game.taskName }
 
   const intOf = (v, dflt, min, max, key) => {
     if (typeof v !== 'number' || !Number.isFinite(v) || !Number.isInteger(v) || v < min || v > max) {
@@ -128,6 +138,7 @@ function validateConfig(c, quiet = false) {
   c.pollIntervalMs = intOf(c.pollIntervalMs, DEFAULT_CONFIG.pollIntervalMs, 500, 10000, 'pollIntervalMs')
   c.heartbeatLogSec = intOf(c.heartbeatLogSec, DEFAULT_CONFIG.heartbeatLogSec, 10, 3600, 'heartbeatLogSec')
   c.onError.timeoutSec = intOf(c.onError.timeoutSec, DEFAULT_CONFIG.onError.timeoutSec, 1, 600, 'onError.timeoutSec')
+  c.game.readyTimeoutSec = intOf(c.game.readyTimeoutSec, DEFAULT_CONFIG.game.readyTimeoutSec, 30, 600, 'game.readyTimeoutSec')
   c.window.nowGraceMin = intOf(c.window.nowGraceMin, DEFAULT_CONFIG.window.nowGraceMin, 0, 720, 'window.nowGraceMin')
   const slotBad = s => !s || typeof s !== 'object' || Array.isArray(s) ||
     !Number.isInteger(s.startHour) || s.startHour < 0 || s.startHour > 23 ||
@@ -141,24 +152,27 @@ function validateConfig(c, quiet = false) {
   delete c.window.startHour // 清理旧单窗口格式残留，避免误读
   delete c.window.endHour
 
-  // 预算链逐级收敛：cap = watchdog - ready - 2×onError - 60s 余量，必须 ≥60。
-  // 任一级不满足就按 watchdog → ready → onError 的顺序回退该项到默认（默认组合 1800-120-120-60=1500 恒有解），
+  // 预算链逐级收敛：cap = watchdog - ready - gameReady(启用时) - 2×onError - 60s 余量，必须 ≥60。
+  // 任一级不满足就按 watchdog → ready → game.ready → onError 的顺序回退该项到默认（默认组合 1800-120-180-60-60=1380 恒有解），
   // 彻底杜绝 cap 为负导致 monitorTimeoutSec 被 clamp 成「过去的时间 → 首轮即超时腰斩任务」。
-  const cap = () => c.watchdogSec - c.readyTimeoutSec - c.onError.timeoutSec * 2 - 60
+  const cap = () => c.watchdogSec - c.readyTimeoutSec - (c.game.enabled ? c.game.readyTimeoutSec : 0) - c.onError.timeoutSec * 2 - 60
   if (cap() < 60 && c.watchdogSec !== DEFAULT_CONFIG.watchdogSec) {
     W(`watchdogSec=${c.watchdogSec} 无法覆盖就绪+错误处理预算，回退默认 1800`); c.watchdogSec = DEFAULT_CONFIG.watchdogSec
   }
   if (cap() < 60 && c.readyTimeoutSec !== DEFAULT_CONFIG.readyTimeoutSec) {
     W(`readyTimeoutSec=${c.readyTimeoutSec} 挤占预算，回退默认 120`); c.readyTimeoutSec = DEFAULT_CONFIG.readyTimeoutSec
   }
+  if (cap() < 60 && c.game.readyTimeoutSec !== DEFAULT_CONFIG.game.readyTimeoutSec) {
+    W(`game.readyTimeoutSec=${c.game.readyTimeoutSec} 挤占预算，回退默认 180`); c.game.readyTimeoutSec = DEFAULT_CONFIG.game.readyTimeoutSec
+  }
   if (cap() < 60 && c.onError.timeoutSec !== DEFAULT_CONFIG.onError.timeoutSec) {
-    W(`onError.timeoutSec=${c.onError.timeoutSec} 挤占预算，回退默认 60`); c.onError.timeoutSec = DEFAULT_CONFIG.onError.timeoutSec
+    W(`onError.timeoutSec=${c.onError.timeoutSec} 挤占预算，回退默认 30`); c.onError.timeoutSec = DEFAULT_CONFIG.onError.timeoutSec
   }
   if (cap() < 60) {
     // 默认组合仍有问题 → 配置已被深度改坏，整体回退默认
     E('配置组合无解（预算链），整体回退内置默认值')
     Object.assign(c, structuredClone(DEFAULT_CONFIG))
-    for (const k of ['window', 'paths', 'maa', 'maend', 'onError']) coerceSection(c, k, quiet)
+    for (const k of ['window', 'paths', 'maa', 'maend', 'game', 'onError']) coerceSection(c, k, quiet)
   }
   c.monitorTimeoutSec = intOf(c.monitorTimeoutSec, DEFAULT_CONFIG.monitorTimeoutSec, 60, 86400, 'monitorTimeoutSec')
   if (c.monitorTimeoutSec > cap()) {
@@ -491,6 +505,25 @@ function checkFlag() {
 }
 
 /* ---------- MAA 通道 B：gui.log 增量尾随 ---------- */
+
+/**
+ * gui.log 尾部文本的收尾判定（纯函数，便于自检）。
+ * MAA v6.19 队列结束有三种形态：
+ *   - 「任务已全部完成」            → 正常收尾
+ *   - 「任务已结束，以下任务出现错误」 → 错误收尾
+ *   - 「游戏掉线，停止任务」→「已停止」 → 队列被中止（掉线自停或手动停止；
+ *     任务未跑完，按失败定性。2026-10-16 生产事故：此前不识别此形态，中止后
+ *     MAA 通道永远等不到完成信号，监测死等直到手动关窗走退出事件）
+ * 返回 null=未见收尾；否则 { failed, via, msg }
+ */
+function judgeMaaLogTail(text) {
+  if (text.includes('任务已全部完成')) return { failed: false, via: 'gui.log', msg: 'gui.log 出现「任务已全部完成」' }
+  if (text.includes('任务已结束，以下任务出现错误')) return { failed: true, via: 'gui.log-error', msg: 'gui.log 出现错误收尾「以下任务出现错误」' }
+  if (text.includes('游戏掉线，停止任务')) return { failed: true, via: 'gui.log-stopped', msg: 'gui.log 出现中止收尾「游戏掉线，停止任务」' }
+  if (/\[TaskQueueViewModel\]\s+<\d+>\s*已停止\s*$/m.test(text)) return { failed: true, via: 'gui.log-stopped', msg: 'gui.log 出现队列停止「已停止」' }
+  return null
+}
+
 function tailMaaLog() {
   const file = cfg.paths.maaLog
   try {
@@ -509,11 +542,12 @@ function tailMaaLog() {
         fs.readSync(fd, buf, 0, len, maaLogPos)
         maaLogPos = st.size
         maaLogPending = (maaLogPending + maaLogDecoder.write(buf)).slice(-400)
-        if (maaLogPending.includes('任务已全部完成')) {
-          if (!maa.done) { maa.done = true; maa.via = 'gui.log'; log('INFO', 'maa', 'gui.log 出现「任务已全部完成」') }
-        } else if (maaLogPending.includes('任务已结束，以下任务出现错误')) {
-          if (!maa.done) { log('WARN', 'maa', 'gui.log 出现错误收尾「以下任务出现错误」') }
-          maa.done = true; maa.failed = true; maa.via = 'gui.log-error'
+        const j = judgeMaaLogTail(maaLogPending)
+        if (j) {
+          if (!maa.done) log(j.failed ? 'WARN' : 'INFO', 'maa', j.msg)
+          maa.done = true
+          if (j.failed) maa.failed = true
+          if (!maa.via) maa.via = j.via
         }
       } finally { fs.closeSync(fd) }
     }
@@ -590,8 +624,12 @@ function injectPostRunScript() {
       throw new Error('未找到 Configurations.Default.Gui.RuntimeSettings.PostRunScript')
     }
     const cur = String(rs.PostRunScript || '')
-    if (cur.includes('--maa-done')) { log('INFO', 'inject', 'PostRunScript 已含本脚本回调，无需修改'); return }
-    if (cur.trim() !== '') {
+    if (cur.includes('--maa-done')) {
+      // 仅含标记还不够：脚本目录移动/改名后旧回调仍带 --maa-done 但指向不存在的路径，
+      // MAA 结束时执行失败 → flag 永远不落盘（2026-10-16 生产事故）。必须校验路径仍是本文件。
+      if (cur.includes(__filename)) { log('INFO', 'inject', 'PostRunScript 已含本脚本回调，无需修改'); return }
+      log('WARN', 'inject', `PostRunScript 回调指向旧路径（脚本已移动？）: ${cur.slice(0, 150)}，将更新为当前路径`)
+    } else if (cur.trim() !== '') {
       log('WARN', 'inject', `PostRunScript 已有用户配置，不覆盖：${cur.slice(0, 100)}；将依赖 gui.log 通道`)
       return
     }
@@ -732,11 +770,76 @@ async function finalize(outcome) {
 
 /* ============================== 启动与就绪 ============================== */
 
+/** 读取 Endfield 进程存活与主窗口标题（弹窗检测用）。Get-Process 对提权进程的标题仍可读。 */
+function gameWindowState() {
+  try {
+    const ps = "$q = Get-Process -Name Endfield -ErrorAction SilentlyContinue; " +
+      "if (-not $q) { 'NONE' } " +
+      "else { $p = $q | Where-Object { $_.MainWindowTitle } | Select-Object -First 1; " +
+      "if ($p) { 'TITLE:' + $p.MainWindowTitle } else { 'RUNNOTITLE' } }"
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
+      { encoding: 'utf8', timeout: 10000 })
+    if (!r.error && r.status === 0) {
+      const t = String(r.stdout || '').trim()
+      if (t.startsWith('TITLE:')) return { running: true, title: t.slice(6) }
+      if (t === 'RUNNOTITLE') return { running: true, title: '' }
+      if (t === 'NONE') return { running: false, title: '' }
+    }
+  } catch { /* fallthrough */ }
+  const fallback = isProcessRunning('Endfield.exe')
+  return { running: fallback === true, title: '' }
+}
+
+const GAME_POPUP_RE = /启动失败|官方启动器/
+
+/**
+ * 确保游戏在运行（终末地 1.6+ 须经计划任务提权、以官方 Games.exe 为父进程拉起）。
+ * 已运行则复用；若停留在校验弹窗则报错（无法自动处理弹窗态）。
+ */
+async function ensureGameRunning() {
+  const running = isProcessRunning('Endfield.exe')
+  log('INFO', 'launch', `启动前进程检查：游戏=${running === null ? '未知' : running}`)
+  if (running === true) {
+    const st = gameWindowState()
+    if (st.title && GAME_POPUP_RE.test(st.title)) {
+      throw new Error(`已在运行的游戏停留在启动校验弹窗（窗口标题: ${st.title}），请先关闭游戏再重跑`)
+    }
+    log('INFO', 'launch', `游戏已在运行${st.title ? `（窗口: ${st.title}）` : ''}，复用`)
+    return
+  }
+  const r = spawnSync('schtasks', ['/Run', '/TN', cfg.game.taskName], { encoding: 'utf8', timeout: 15000 })
+  const out = ((r.stdout || '') + (r.stderr || '')).trim().replace(/\s+/g, ' ')
+  if (r.error || r.status !== 0) {
+    throw new Error(`触发游戏启动计划任务 ${cfg.game.taskName} 失败: ${r.error ? r.error.message : out || `exit ${r.status}`}`)
+  }
+  log('INFO', 'launch', `已触发计划任务 ${cfg.game.taskName} 提权拉起游戏（${out}）`)
+
+  const deadline = Date.now() + cfg.game.readyTimeoutSec * 1000
+  let sawProcess = false
+  while (Date.now() < deadline) {
+    const st = gameWindowState()
+    if (st.running) sawProcess = true
+    if (st.title && GAME_POPUP_RE.test(st.title)) {
+      throw new Error(`游戏弹出启动校验弹窗（窗口标题: ${st.title}）——计划任务方案失效或任务未以最高权限注册`)
+    }
+    if (st.running && /Endfield/i.test(st.title || '')) {
+      log('INFO', 'launch', `游戏窗口就绪（${st.title}）`)
+      return
+    }
+    await sleep(2000)
+  }
+  throw new Error(`游戏启动就绪超时(${cfg.game.readyTimeoutSec}s)：` +
+    (sawProcess ? '进程已出现但窗口未就绪（可能存在弹窗或启动器更新中）' : '进程未出现（计划任务触发失败？检查任务是否存在）'))
+}
+
 async function launchAndReady() {
   // exe 预检（路径不存在 → 错误路径）
   for (const [name, p] of [['MAA', cfg.paths.maaExe], ['MaaEnd', cfg.paths.maaendExe]]) {
     if (!fs.existsSync(p)) throw new Error(`${name} 可执行文件不存在: ${p}`)
   }
+
+  // 游戏先启动（1.6+ 须经计划任务提权拉起）；MaaEnd 的前置动作 skipIfRunning 会因游戏已在运行而跳过直启
+  if (cfg.game.enabled) await ensureGameRunning()
 
   // gui.log 读取基线：必须在启动/复用 MAA 之前记录（否则 ready 等待期内写入的完成行会被跳过）
   try { maaLogPos = fs.statSync(cfg.paths.maaLog).size } catch { maaLogPos = -1 } // -1=暂不可基线化，稍后恢复时以当时文件尾为基线
@@ -947,9 +1050,9 @@ async function selfTest() {
   T('非法 watchdogSec 回退默认 1800', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { watchdogSec: 'abc' }); validateConfig(c, true); return c.watchdogSec === 1800
   })())
-  T('预算链 clamp: watchdog=600 时 monitor 压到 300', (() => {
+  T('预算链 clamp: watchdog=600 时 monitor 压到 180（游戏180+错误2×30）', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { watchdogSec: 600, monitorTimeoutSec: 1500 }); validateConfig(c, true)
-    return c.monitorTimeoutSec === 600 - 120 - 120 - 60
+    return c.monitorTimeoutSec === 600 - 120 - 180 - 60 - 60
   })())
   T('非法 shutdownGraceSec 回退默认 5', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { shutdownGraceSec: -3 }); validateConfig(c, true); return c.shutdownGraceSec === 5
@@ -995,6 +1098,14 @@ async function selfTest() {
   T('MaaEnd: 见过 running + Succeeded → 完成', (() => { const j = judgeMaaEnd(stateOf(false, 'Succeeded'), true); return j.kind === 'done' && j.failed === false })())
   T('MaaEnd: 见过 running + Failed → 完成但标错', (() => { const j = judgeMaaEnd(stateOf(false, 'Failed'), true); return j.kind === 'done' && j.failed === true })())
   T('MaaEnd: null 终态不算完成', judgeMaaEnd(stateOf(false, null), true).kind === 'waiting')
+
+  // gui.log 收尾判定
+  T('gui.log: 正常完成', (() => { const j = judgeMaaLogTail('[INF][TaskQueueViewModel] <2> 任务已全部完成！\n'); return j && j.failed === false && j.via === 'gui.log' })())
+  T('gui.log: 错误收尾 → failed', (() => { const j = judgeMaaLogTail('任务已结束，以下任务出现错误'); return j && j.failed === true })())
+  T('gui.log: 游戏掉线中止 → failed', (() => { const j = judgeMaaLogTail('[ERR][TaskQueueViewModel] <2> 游戏掉线，停止任务\n'); return j && j.failed === true && j.via === 'gui.log-stopped' })())
+  T('gui.log: 队列「已停止」行 → failed', (() => { const j = judgeMaaLogTail('[2026-10-16 00:29:04.737][INF][TaskQueueViewModel]     <2> 已停止\n'); return j && j.failed === true })())
+  T('gui.log: 运行中内容不误判', judgeMaaLogTail('[INF][TaskQueueViewModel] <2> 当前设施: 制造站 01\n已刷新标签\n正在停止……\n') === null)
+  T('gui.log: 无收尾标记 → null', judgeMaaLogTail('random log line') === null)
 
   // 回调命令格式（MAA ExecuteScript 要求以双引号开头）
   const cmd = maaCallbackCmd()
@@ -1127,6 +1238,7 @@ async function main() {
 
     if (flags.dryRun) {
       injectPostRunScript()
+      if (cfg.game.enabled) log('DRY ', 'launch', `[dry-run] 将触发计划任务拉起游戏: ${cfg.game.taskName}（等待窗口就绪 ≤${cfg.game.readyTimeoutSec}s）`)
       log('DRY ', 'launch', `[dry-run] 将启动: ${cfg.paths.maaExe}`)
       log('DRY ', 'launch', `[dry-run] 将启动: ${cfg.paths.maaendExe}`)
       log('DRY ', 'monitor', `[dry-run] 将轮询: MAA(flag+gui.log) / MaaEnd(12701-12710/api/maa/state + ws)，超时 ${cfg.monitorTimeoutSec}s`)

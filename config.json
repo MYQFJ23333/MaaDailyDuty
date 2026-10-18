@@ -2,8 +2,7 @@
   "window": {
     "slots": [
       { "startHour": 3, "endHour": 4 },
-      { "startHour": 7, "endHour": 8 },
-      { "startHour": 17, "endHour": 18 }
+      { "startHour": 7, "endHour": 8 }
     ],
     "nowGraceMin": 60
   },
@@ -14,7 +13,7 @@
     "maaendExe": "D:\\Program Files\\MaaEnd\\MaaEnd.exe"
   },
   "watchdogSec": 1800,
-  "monitorTimeoutSec": 1500,
+  "monitorTimeoutSec": 1380,
   "readyTimeoutSec": 120,
   "maaReadyStableSec": 5,
   "shutdownGraceSec": 5,
@@ -30,6 +29,6 @@
   "onError": {
     "command": "",
     "args": [],
-    "timeoutSec": 60
+    "timeoutSec": 30
   }
 }
