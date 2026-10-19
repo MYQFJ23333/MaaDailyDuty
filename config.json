@@ -30,7 +30,7 @@
   },
   "game": {
     "enabled": true,
-    "taskName": "MaaDutyLaunchGame",
+    "taskName": "MDDLaunchGame",
     "readyTimeoutSec": 180
   },
   "onError": {

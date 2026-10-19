@@ -19,7 +19,7 @@ export async function handle(err, ctx) {
   ctx.log('ERROR', 'onError-handler', `[自定义错误处理] stage=${ctx.stage} message=${err?.message}`)
 
   // 示例 1：Windows 弹窗通知（会阻塞，注意控制时长，仅作演示）
-  // spawnSync('msg', ['*', '/TIME:10', `MaaDuty 出错：${err?.message}`], { windowsHide: true })
+  // spawnSync('msg', ['*', '/TIME:10', `MaaDailyDuty 出错：${err?.message}`], { windowsHide: true })
 
   // 示例 2：写一份错误快照供事后分析
   // import fs from 'node:fs'

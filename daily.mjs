@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * daily.mjs — MaaDuty 全自动日常主控脚本
+ * daily.mjs — MaaDailyDuty 全自动日常主控脚本
  *
  * 职责：
  *   1. 判断本次开机时间是否落在凌晨 [03:00, 04:00) 窗口（不在窗口则静默退出）
@@ -80,7 +80,7 @@ const DEFAULT_CONFIG = {
     // 由计划任务（管理员权限）运行 launch-endfield.ps1：挂起创建官方 Games.exe 作父进程再拉起游戏。
     // 计划任务注册需一次性管理员授权（schtasks /Create /RL HIGHEST）；日常触发 schtasks /Run 无需提权。
     enabled: true,
-    taskName: 'MaaDutyLaunchGame', // 触发游戏启动的计划任务名
+    taskName: 'MDDLaunchGame', // 触发游戏启动的计划任务名
     readyTimeoutSec: 180,           // 触发后等待游戏窗口就绪上限（含提权脚本编译与游戏本体启动耗时）
   },
   onError: {
@@ -127,7 +127,7 @@ function validateConfig(c, quiet = false) {
   if (typeof c.onError.command !== 'string') { W('onError.command 不是字符串，置空'); c.onError.command = '' }
   if (!Array.isArray(c.onError.args)) { W(`onError.args=${JSON.stringify(c.onError.args)} 不是数组，置空`); c.onError.args = [] }
   if (typeof c.game.enabled !== 'boolean') { W(`game.enabled=${JSON.stringify(c.game.enabled)} 非法，回退默认 true`); c.game.enabled = DEFAULT_CONFIG.game.enabled }
-  if (typeof c.game.taskName !== 'string' || !c.game.taskName.trim()) { W('game.taskName 非法（须为非空字符串），回退默认 MaaDutyLaunchGame'); c.game.taskName = DEFAULT_CONFIG.game.taskName }
+  if (typeof c.game.taskName !== 'string' || !c.game.taskName.trim()) { W('game.taskName 非法（须为非空字符串），回退默认 MDDLaunchGame'); c.game.taskName = DEFAULT_CONFIG.game.taskName }
 
   const intOf = (v, dflt, min, max, key) => {
     if (typeof v !== 'number' || !Number.isFinite(v) || !Number.isInteger(v) || v < min || v > max) {
@@ -1047,7 +1047,7 @@ const wtIdx = argv.indexOf('--window-test')
 const windowTestArg = wtIdx >= 0 ? (argv[wtIdx + 1] || null) : null
 
 function printHelp() {
-  console.log(`MaaDuty 全自动日常主控脚本 (daily.mjs)
+  console.log(`MaaDailyDuty 全自动日常主控脚本 (daily.mjs)
 
 用法:
   node daily.mjs                正常运行（由开机计划任务调用）

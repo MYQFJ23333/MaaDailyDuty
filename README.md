@@ -1,8 +1,8 @@
-# MaaDuty — 全自动日常（MAA + MaaEnd 无人值守关机）
+# MaaDailyDuty — 全自动日常（MAA + MaaEnd 无人值守关机）
 
 电脑在你指定的时段自动开机后，**自动跑完《明日方舟》与《终末地》的全部日常，然后自动关机**——全程无人值守，专为「凌晨挂机跑日常」设计。
 
-- MAA 负责《明日方舟》日常，MaaEnd 负责《终末地》日常，本脚本是把它们串起来并负责关机的主控。
+- [MAA](https://github.com/MaaAssistantArknights/MaaAssistantArknights) 负责《明日方舟》日常，[MaaEnd](https://github.com/MaaEnd/MaaEnd) 负责《终末地》日常，本脚本是把它们串起来并负责关机的主控。
 - 你只需要：在 BIOS 里定时开机 + 本项目注册一次计划任务。之后每天到点自动执行，跑完即关机。
 
 ## 功能特性
@@ -54,7 +54,7 @@
 
 ### 第 1 步：放置项目
 
-把本项目放到任意目录（下文以 `$dir` 指代），例如 `C:\Users\你\MaaDuty`。
+把本项目放到任意目录（下文以 `$dir` 指代），例如 `C:\Users\你\MaaDailyDuty`。
 目录被移动/改名后无需其他操作，但若曾运行过，请删除 `state\ran-*.json` 以便重新验证。
 
 ### 第 2 步：修改 config.json（必做）
@@ -87,7 +87,7 @@
 ### 第 4 步：注册计划任务（管理员 PowerShell）
 
 ```powershell
-$dir  = "C:\Users\你\MaaDuty"          # ← 改成你实际的项目目录
+$dir  = "C:\Users\你\MaaDailyDuty"     # ← 改成你实际的项目目录
 $node = "C:\Program Files\nodejs\node.exe"  # ← 用 `where.exe node` 核对
 
 # ① 主控任务：登录后 15 秒拉起 daily.mjs
@@ -96,24 +96,24 @@ $action   = New-ScheduledTaskAction -Execute $node -Argument "`"$dir\daily.mjs`"
 $trigger  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERNAME" -Delay (New-TimeSpan -Seconds 15)
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 75) -StartWhenAvailable -AllowStartIfOnBatteries
-Register-ScheduledTask -TaskName "MaaDuty" -Action $action -Trigger $trigger -Settings $settings -Force
+Register-ScheduledTask -TaskName "MaaDailyDuty" -Action $action -Trigger $trigger -Settings $settings -Force
 
 # ② 游戏启动任务：仅由 daily.mjs 经 schtasks /Run 触发，本身无自动触发器
 #    （终末地 1.6+ 校验父进程须为官方 Games.exe，需提权运行 launch-endfield.ps1）
 $psAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dir\launch-endfield.ps1`""
 $psPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -RunLevel Highest
-Register-ScheduledTask -TaskName "MaaDutyLaunchGame" -Action $psAction -Principal $psPrincipal -Force
+Register-ScheduledTask -TaskName "MDDLaunchGame" -Action $psAction -Principal $psPrincipal -Force
 ```
 
 要点：
 
 - 游戏安装路径与本机不同时，编辑 `launch-endfield.ps1` 顶部的 `$GameDir` / `$LauncherRoot` 默认参数
   （或在计划任务的启动命令后追加 `-GameDir "..." -LauncherRoot "..."`）。
-- 游戏任务名必须与 `config.json → game.taskName` 一致（默认 `MaaDutyLaunchGame`）。
+- 游戏任务名必须与 `config.json → game.taskName` 一致（默认 `MDDLaunchGame`）。
 - 主控任务**不要**加 `--force` 参数（那是调试开关，会绕过时间窗与当日配额）。
 - 若不需要本项目代管游戏启动（例如你的终末地版本无父进程校验），设 `game.enabled=false` 即可跳过第 ② 步。
-- 检查任务状态：`Get-ScheduledTask MaaDuty, MaaDutyLaunchGame | Get-ScheduledTaskInfo`。
+- 检查任务状态：`Get-ScheduledTask MaaDailyDuty, MDDLaunchGame | Get-ScheduledTaskInfo`。
 
 ### 第 5 步：测试验证
 
@@ -166,7 +166,7 @@ node daily.mjs --dry-run --force # 3. 全链路演练：打印将执行的全部
 | `maend.portScan` | `[12701..12710]` | MaaEnd web 端口探测范围（默认端口被占时自动回退试下一个） |
 | `maend.wsEnabled` | true | WebSocket `tasks-completed` 事件加速完成检测（Node ≥ 21 时生效，缺失自动降级纯轮询） |
 | `game.enabled` | true | 是否由本脚本拉起终末地（经提权计划任务，绕过 1.6+ 父进程校验）。设 `false` 则跳过，游戏需自行保证在运行 |
-| `game.taskName` | `MaaDutyLaunchGame` | 拉起游戏用的计划任务名（须与第 4 步注册的任务名一致） |
+| `game.taskName` | `MDDLaunchGame` | 拉起游戏用的计划任务名（须与第 4 步注册的任务名一致） |
 | `game.readyTimeoutSec` | 180 | 触发后等待游戏窗口就绪上限（秒，含提权编译与游戏启动耗时） |
 | `shutdownGraceSec` | 5 | 关机前宽限秒数（给日志 flush；>0 时 shutdown 自动隐含 `/f`） |
 | `pollIntervalMs` | 2000 | 完成信号轮询间隔（毫秒） |
