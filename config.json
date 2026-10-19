@@ -4,7 +4,8 @@
       { "startHour": 3, "endHour": 4 },
       { "startHour": 7, "endHour": 8 }
     ],
-    "nowGraceMin": 60
+    "nowGraceMin": 60,
+    "dailyMaxRuns": 2
   },
   "paths": {
     "maaExe": "D:\\Program Files\\MAA\\MAA.exe",
@@ -12,19 +13,25 @@
     "maaLog": "D:\\Program Files\\MAA\\debug\\gui.log",
     "maaendExe": "D:\\Program Files\\MaaEnd\\MaaEnd.exe"
   },
-  "watchdogSec": 1800,
-  "monitorTimeoutSec": 1380,
+  "watchdogSec": 3600,
+  "monitorTimeoutSec": 1800,
   "readyTimeoutSec": 120,
   "maaReadyStableSec": 5,
   "shutdownGraceSec": 5,
   "pollIntervalMs": 2000,
   "heartbeatLogSec": 60,
   "maa": {
-    "injectPostRunScript": true
+    "injectPostRunScript": true,
+    "settleSec": 30
   },
   "maend": {
     "portScan": [12701, 12702, 12703, 12704, 12705, 12706, 12707, 12708, 12709, 12710],
     "wsEnabled": true
+  },
+  "game": {
+    "enabled": true,
+    "taskName": "MaaDutyLaunchGame",
+    "readyTimeoutSec": 180
   },
   "onError": {
     "command": "",

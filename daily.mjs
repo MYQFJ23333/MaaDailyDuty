@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /**
- * daily.mjs — 全自动日常主控脚本
+ * daily.mjs — MaaDuty 全自动日常主控脚本
  *
  * 职责：
  *   1. 判断本次开机时间是否落在凌晨 [03:00, 04:00) 窗口（不在窗口则静默退出）
- *   2. 挂载 30 分钟关机看门狗（防未知错误导致整夜开机）
- *   3. 启动 MAA.exe 与 MaaEnd.exe 并监听双方「全部任务完成」信号
+ *   2. 挂载 1 小时关机看门狗（防未知错误导致整夜开机；过短会在任务进行中弹系统关机提示抢焦点）
+ *   3. 先启动 MAA.exe 并静置（等模拟器窗口稳定），再拉起终末地与 MaaEnd.exe，
+ *      监听双方「全部任务完成」信号
  *   4. 双方均完成 → 立即关机；任何错误 → 执行预留的错误处理接口 → 依旧关机
  *
  * 用法：
@@ -49,6 +50,7 @@ const DEFAULT_CONFIG = {
       { startHour: 7, endHour: 8 },
     ],
     nowGraceMin: 60,  // 每段的当前时刻上限宽限：now 必须 < 该段 endHour+此值（覆盖登录延迟；防晚登录/重登录时误执行）
+    dailyMaxRuns: 1,  // 每日至多成功执行轮数。仅成功计入：失败/超时/崩溃不占额度，下次开机落在时段内自动重试
   },
   paths: {
     maaExe: 'D:\\Program Files\\MAA\\MAA.exe',
@@ -56,8 +58,9 @@ const DEFAULT_CONFIG = {
     maaLog: 'D:\\Program Files\\MAA\\debug\\gui.log',
     maaendExe: 'D:\\Program Files\\MaaEnd\\MaaEnd.exe',
   },
-  watchdogSec: 2100,          // 判定通过后挂载的兜底关机（35 分钟 = 游戏3 + 就绪2 + 监测25 + 错误2×1 + 余量1 + 缓冲2）
-  monitorTimeoutSec: 1380,    // 监测总时限；启动时会按预算链自动 clamp（ready+gameReady+monitor+2×onError+60s ≤ watchdogSec）
+  watchdogSec: 3600,          // 判定通过后挂载的兜底关机（1 小时）。Windows 在关机前约 10 分钟会弹全屏提示，
+                              // 30 分钟级看门狗会在任务仍在跑时弹出并抢焦点、干扰 MaaEnd——故兜底拉长到 1h
+  monitorTimeoutSec: 1380,    // 监测总时限；启动时会按预算链自动 clamp（ready+gameReady+maaSettle+monitor+2×onError+60s ≤ watchdogSec）
   readyTimeoutSec: 120,       // 两进程启动就绪上限
   maaReadyStableSec: 5,       // MAA 进程持续存活多久算启动成功
   shutdownGraceSec: 5,        // 关机前宽限（>0 时 shutdown 自动隐含 /f）
@@ -65,6 +68,8 @@ const DEFAULT_CONFIG = {
   heartbeatLogSec: 60,        // 监测心跳日志间隔
   maa: {
     injectPostRunScript: true, // 启动 MAA 前自动注入「结束后脚本」回调（仅当该配置为空）
+    settleSec: 30,             // 新启动 MAA 后的静置秒数：MAA 会拉起模拟器，其窗口弹出抢焦点会干扰
+                               // 随后启动的 MaaEnd 任务；先等窗口稳定再启动游戏与 MaaEnd（0=禁用；复用 MAA 时跳过）
   },
   maend: {
     portScan: [12701, 12702, 12703, 12704, 12705, 12706, 12707, 12708, 12709, 12710],
@@ -75,7 +80,7 @@ const DEFAULT_CONFIG = {
     // 由计划任务（管理员权限）运行 launch-endfield.ps1：挂起创建官方 Games.exe 作父进程再拉起游戏。
     // 计划任务注册需一次性管理员授权（schtasks /Create /RL HIGHEST）；日常触发 schtasks /Run 无需提权。
     enabled: true,
-    taskName: 'DawnDutyLaunchGame', // 触发游戏启动的计划任务名
+    taskName: 'MaaDutyLaunchGame', // 触发游戏启动的计划任务名
     readyTimeoutSec: 180,           // 触发后等待游戏窗口就绪上限（含提权脚本编译与游戏本体启动耗时）
   },
   onError: {
@@ -122,7 +127,7 @@ function validateConfig(c, quiet = false) {
   if (typeof c.onError.command !== 'string') { W('onError.command 不是字符串，置空'); c.onError.command = '' }
   if (!Array.isArray(c.onError.args)) { W(`onError.args=${JSON.stringify(c.onError.args)} 不是数组，置空`); c.onError.args = [] }
   if (typeof c.game.enabled !== 'boolean') { W(`game.enabled=${JSON.stringify(c.game.enabled)} 非法，回退默认 true`); c.game.enabled = DEFAULT_CONFIG.game.enabled }
-  if (typeof c.game.taskName !== 'string' || !c.game.taskName.trim()) { W('game.taskName 非法（须为非空字符串），回退默认 DawnDutyLaunchGame'); c.game.taskName = DEFAULT_CONFIG.game.taskName }
+  if (typeof c.game.taskName !== 'string' || !c.game.taskName.trim()) { W('game.taskName 非法（须为非空字符串），回退默认 MaaDutyLaunchGame'); c.game.taskName = DEFAULT_CONFIG.game.taskName }
 
   const intOf = (v, dflt, min, max, key) => {
     if (typeof v !== 'number' || !Number.isFinite(v) || !Number.isInteger(v) || v < min || v > max) {
@@ -134,12 +139,14 @@ function validateConfig(c, quiet = false) {
   c.watchdogSec = intOf(c.watchdogSec, DEFAULT_CONFIG.watchdogSec, 60, 86400, 'watchdogSec')
   c.readyTimeoutSec = intOf(c.readyTimeoutSec, DEFAULT_CONFIG.readyTimeoutSec, 10, 600, 'readyTimeoutSec')
   c.maaReadyStableSec = intOf(c.maaReadyStableSec, DEFAULT_CONFIG.maaReadyStableSec, 1, 60, 'maaReadyStableSec')
+  c.maa.settleSec = intOf(c.maa.settleSec, DEFAULT_CONFIG.maa.settleSec, 0, 600, 'maa.settleSec')
   c.shutdownGraceSec = intOf(c.shutdownGraceSec, DEFAULT_CONFIG.shutdownGraceSec, 0, 3600, 'shutdownGraceSec')
   c.pollIntervalMs = intOf(c.pollIntervalMs, DEFAULT_CONFIG.pollIntervalMs, 500, 10000, 'pollIntervalMs')
   c.heartbeatLogSec = intOf(c.heartbeatLogSec, DEFAULT_CONFIG.heartbeatLogSec, 10, 3600, 'heartbeatLogSec')
   c.onError.timeoutSec = intOf(c.onError.timeoutSec, DEFAULT_CONFIG.onError.timeoutSec, 1, 600, 'onError.timeoutSec')
   c.game.readyTimeoutSec = intOf(c.game.readyTimeoutSec, DEFAULT_CONFIG.game.readyTimeoutSec, 30, 600, 'game.readyTimeoutSec')
   c.window.nowGraceMin = intOf(c.window.nowGraceMin, DEFAULT_CONFIG.window.nowGraceMin, 0, 720, 'window.nowGraceMin')
+  c.window.dailyMaxRuns = intOf(c.window.dailyMaxRuns, DEFAULT_CONFIG.window.dailyMaxRuns, 1, 10, 'window.dailyMaxRuns')
   const slotBad = s => !s || typeof s !== 'object' || Array.isArray(s) ||
     !Number.isInteger(s.startHour) || s.startHour < 0 || s.startHour > 23 ||
     !Number.isInteger(s.endHour) || s.endHour < 1 || s.endHour > 24 ||
@@ -152,12 +159,13 @@ function validateConfig(c, quiet = false) {
   delete c.window.startHour // 清理旧单窗口格式残留，避免误读
   delete c.window.endHour
 
-  // 预算链逐级收敛：cap = watchdog - ready - gameReady(启用时) - 2×onError - 60s 余量，必须 ≥60。
-  // 任一级不满足就按 watchdog → ready → game.ready → onError 的顺序回退该项到默认（默认组合 1800-120-180-60-60=1380 恒有解），
+  // 预算链逐级收敛：cap = watchdog - ready - gameReady(启用时) - maaSettle(启用时) - 2×onError - 60s 余量，必须 ≥60。
+  // 任一级不满足就按 watchdog → ready → game.ready → onError 的顺序回退该项到默认（settle 不参与回退：
+  // 砍静置会复活「模拟器抢焦点」问题；默认组合 3600-120-180-30-60-60=3150 恒有解），
   // 彻底杜绝 cap 为负导致 monitorTimeoutSec 被 clamp 成「过去的时间 → 首轮即超时腰斩任务」。
-  const cap = () => c.watchdogSec - c.readyTimeoutSec - (c.game.enabled ? c.game.readyTimeoutSec : 0) - c.onError.timeoutSec * 2 - 60
+  const cap = () => c.watchdogSec - c.readyTimeoutSec - (c.game.enabled ? c.game.readyTimeoutSec : 0) - c.maa.settleSec - c.onError.timeoutSec * 2 - 60
   if (cap() < 60 && c.watchdogSec !== DEFAULT_CONFIG.watchdogSec) {
-    W(`watchdogSec=${c.watchdogSec} 无法覆盖就绪+错误处理预算，回退默认 1800`); c.watchdogSec = DEFAULT_CONFIG.watchdogSec
+    W(`watchdogSec=${c.watchdogSec} 无法覆盖就绪+错误处理预算，回退默认 ${DEFAULT_CONFIG.watchdogSec}`); c.watchdogSec = DEFAULT_CONFIG.watchdogSec
   }
   if (cap() < 60 && c.readyTimeoutSec !== DEFAULT_CONFIG.readyTimeoutSec) {
     W(`readyTimeoutSec=${c.readyTimeoutSec} 挤占预算，回退默认 120`); c.readyTimeoutSec = DEFAULT_CONFIG.readyTimeoutSec
@@ -180,7 +188,7 @@ function validateConfig(c, quiet = false) {
     c.monitorTimeoutSec = cap()
   }
   // 终检：clamp 结果不得低于下界（防御任何未预见的组合）
-  if (c.monitorTimeoutSec < 60) { c.monitorTimeoutSec = DEFAULT_CONFIG.monitorTimeoutSec; W('monitorTimeoutSec 收敛异常，回退默认 1500') }
+  if (c.monitorTimeoutSec < 60) { c.monitorTimeoutSec = DEFAULT_CONFIG.monitorTimeoutSec; W(`monitorTimeoutSec 收敛异常，回退默认 ${DEFAULT_CONFIG.monitorTimeoutSec}`) }
 }
 
 function loadConfig() {
@@ -272,25 +280,59 @@ function withTimeout(promise, ms, tag) {
 
 /* ============================== 单实例锁 ============================== */
 
-/** 当日已执行标志：每个自然日至多完整执行一轮（防同日多次登录/手动重跑重复挂看门狗并关机） */
+/* ============================ 当日执行配额 ============================ */
+
+/**
+ * 当日运行记录：每个自然日成功至多 window.dailyMaxRuns 轮（仅成功计入配额）。
+ *  - 成功 → ok:true，计入额度；额度用尽后同日再登录/手动重跑被静默拦下。
+ *  - 失败/超时 → ok:false 记档但不占额度 → 下次开机落在时间窗内会自动重试。
+ *  - 进程崩溃/中断 → ok:null（pending）残留，同样不占额度、不拦截重试。
+ * 文件按天切分（ran-日期.json），跨天自动换文件，旧文件无需清理。
+ * 检查与回写由单实例锁保证同一时刻仅一个进程操作。
+ */
 function ranFlagPath() {
   const d = new Date(); const p = n => String(n).padStart(2, '0')
   return path.join(STATE_DIR, `ran-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.json`)
 }
-function checkRanToday() {
+/** 解析记录文件内容。兼容升级前的旧单对象格式 {boot,at,pid}：按旧语义「写入即已执行」视为一次已完成轮次（ok:true） */
+function parseRanDoc(raw) {
   try {
-    const old = JSON.parse(fs.readFileSync(ranFlagPath(), 'utf8'))
-    return old || null
-  } catch { return null }
+    const o = JSON.parse(raw)
+    if (Array.isArray(o?.runs)) return o.runs.filter(r => r && typeof r === 'object')
+    if (o && typeof o === 'object' && !Array.isArray(o)) return [{ ...o, ok: true }]
+  } catch { }
+  return []
 }
-function markRanToday(boot) {
+function ranSucceededCount(runs) { return runs.filter(r => r.ok === true).length }
+function readRanToday() {
+  try { return parseRanDoc(fs.readFileSync(ranFlagPath(), 'utf8')) } catch { return [] }
+}
+function writeRanToday(runs) {
+  const p = ranFlagPath()
+  const tmp = p + '.tmp'
+  fs.writeFileSync(tmp, JSON.stringify({ runs }, null, 2), 'utf8')
+  fs.renameSync(tmp, p)
+}
+let myRanId = null
+/** 主流程开始时登记一条 pending 记录（不占成功额度；结果由 endRan 回写） */
+function beginRan(boot) {
   try {
-    const p = ranFlagPath()
-    const tmp = p + '.tmp'
-    fs.writeFileSync(tmp, JSON.stringify({ boot: boot ? boot.toISOString() : null, at: ts(), pid: process.pid }, null, 2), 'utf8')
-    fs.renameSync(tmp, p)
+    const runs = readRanToday()
+    myRanId = `${process.pid}-${Date.now()}`
+    runs.push({ id: myRanId, boot: boot ? boot.toISOString() : null, at: ts(), pid: process.pid, ok: null })
+    writeRanToday(runs)
     return true
-  } catch (e) { log('WARN', 'lock', `写入当日执行标志失败: ${e.message}`); return false }
+  } catch (e) { log('WARN', 'quota', `写入当日运行记录失败（不影响本轮执行，仅结果无法计入配额统计）: ${e.message}`); return false }
+}
+/** 本轮结束时回写结果：成功计入配额；失败记档不占额度。--force/dry-run 未登记 → 空操作 */
+function endRan(ok, stage) {
+  if (!myRanId) return
+  try {
+    const runs = readRanToday()
+    const r = runs.find(x => x.id === myRanId)
+    if (r) { r.ok = !!ok; r.stage = stage || null; r.endAt = ts() }
+    writeRanToday(runs)
+  } catch (e) { log('WARN', 'quota', `回写当日运行结果失败（本次结果不计入配额统计）: ${e.message}`) }
 }
 
 async function acquireLock() {
@@ -744,6 +786,9 @@ async function finalize(outcome) {
     return
   }
 
+  // 回写当日运行记录：成功计入配额；失败记档但不占额度（下次开机落在时段内自动重试）
+  endRan(!isError, outcome.stage || (isError ? 'ERROR' : 'ALL_DONE'))
+
   if (isError) {
     log('ERROR', outcome.stage || 'ERROR', `进入错误路径：${outcome.err?.message || outcome.err || '(无详情)'}`)
     await runErrorHandlers(outcome)
@@ -838,15 +883,11 @@ async function launchAndReady() {
     if (!fs.existsSync(p)) throw new Error(`${name} 可执行文件不存在: ${p}`)
   }
 
-  // 游戏先启动（1.6+ 须经计划任务提权拉起）；MaaEnd 的前置动作 skipIfRunning 会因游戏已在运行而跳过直启
-  if (cfg.game.enabled) await ensureGameRunning()
-
   // gui.log 读取基线：必须在启动/复用 MAA 之前记录（否则 ready 等待期内写入的完成行会被跳过）
   try { maaLogPos = fs.statSync(cfg.paths.maaLog).size } catch { maaLogPos = -1 } // -1=暂不可基线化，稍后恢复时以当时文件尾为基线
 
   const maaRunning = isProcessRunning('MAA.exe')
-  const endRunning = isProcessRunning('MaaEnd.exe')
-  log('INFO', 'launch', `启动前进程检查：MAA=${maaRunning === null ? '未知' : maaRunning} MaaEnd=${endRunning === null ? '未知' : endRunning}`)
+  log('INFO', 'launch', `启动前进程检查：MAA=${maaRunning === null ? '未知' : maaRunning}`)
 
   // MAA 配置注入（仅当 MAA 未在运行）
   if (maaRunning === true) log('WARN', 'inject', 'MAA 已在运行，跳过配置注入（内存态配置不受文件影响），依赖 gui.log 通道')
@@ -867,6 +908,22 @@ async function launchAndReady() {
       : '复用已在运行的 MAA 进程（将以周期性进程探活替代退出事件）')
   }
 
+  // MAA 静置：新启动的 MAA 会拉起模拟器，模拟器窗口弹出抢占焦点会干扰随后启动的 MaaEnd 任务；
+  // 先等窗口稳定（settleSec）再启动游戏与 MaaEnd。等待期间每秒探活，MAA 提前退出立即走错误路径
+  if (maaRunning === false && cfg.maa.settleSec > 0) {
+    log('INFO', 'launch', `MAA 静置等待 ${cfg.maa.settleSec}s（等模拟器窗口稳定，避免焦点抢占干扰 MaaEnd）`)
+    const settleUntil = Date.now() + cfg.maa.settleSec * 1000
+    while (Date.now() < settleUntil) {
+      if (exitInfo.maa && maaChild) throw new Error(`MAA 启动后退出（code=${exitInfo.maa.code}）`)
+      await sleep(1000)
+    }
+  }
+
+  // 游戏在 MaaEnd 之前启动（1.6+ 须经计划任务提权拉起）；MaaEnd 的前置动作 skipIfRunning 会因游戏已在运行而跳过直启
+  if (cfg.game.enabled) await ensureGameRunning()
+
+  const endRunning = isProcessRunning('MaaEnd.exe')
+  log('INFO', 'launch', `启动前进程检查：MaaEnd=${endRunning === null ? '未知' : endRunning}`)
   if (endRunning === false) {
     maendChild = spawnApp('maend', cfg.paths.maaendExe)
     log('INFO', 'launch', `已启动 MaaEnd pid=${maendChild.pid}`)
@@ -990,11 +1047,11 @@ const wtIdx = argv.indexOf('--window-test')
 const windowTestArg = wtIdx >= 0 ? (argv[wtIdx + 1] || null) : null
 
 function printHelp() {
-  console.log(`全自动日常主控脚本 (daily.mjs)
+  console.log(`MaaDuty 全自动日常主控脚本 (daily.mjs)
 
 用法:
   node daily.mjs                正常运行（由开机计划任务调用）
-  node daily.mjs --force        跳过时间窗判定（调试；看门狗等安全语义不变）
+  node daily.mjs --force        跳过时间窗与当日配额判定（调试；看门狗等安全语义不变）
   node daily.mjs --dry-run      演练模式：只打印将执行的动作，不挂看门狗/不启动/不注入/不关机
   node daily.mjs --window-test [ISO时间]  打印开机时间与窗口判定（只读）
   node daily.mjs --self-test    自检时间窗与完成判定逻辑
@@ -1047,12 +1104,15 @@ async function selfTest() {
   T('boot 07:30、now 09:30 → 静默（超第二段上限 09:00）', (() => { const r = W(D('2026-10-15T07:30:00'), D('2026-10-15T07:30:05'), D('2026-10-15T09:30:00')); return r.matchedBoot === true && r.inWin === false })())
 
   // 配置校验与看门狗预算链 clamp
-  T('非法 watchdogSec 回退默认 1800', (() => {
-    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { watchdogSec: 'abc' }); validateConfig(c, true); return c.watchdogSec === 1800
+  T(`非法 watchdogSec 回退默认 ${DEFAULT_CONFIG.watchdogSec}`, (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { watchdogSec: 'abc' }); validateConfig(c, true); return c.watchdogSec === DEFAULT_CONFIG.watchdogSec
   })())
-  T('预算链 clamp: watchdog=600 时 monitor 压到 180（游戏180+错误2×30）', (() => {
+  T('非法 maa.settleSec 回退默认 30', (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { maa: { settleSec: -5 } }); validateConfig(c, true); return c.maa.settleSec === DEFAULT_CONFIG.maa.settleSec
+  })())
+  T('预算链 clamp: watchdog=600 时 monitor 压到 150（游戏180+静置30+错误2×30）', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { watchdogSec: 600, monitorTimeoutSec: 1500 }); validateConfig(c, true)
-    return c.monitorTimeoutSec === 600 - 120 - 180 - 60 - 60
+    return c.monitorTimeoutSec === 600 - 120 - 180 - DEFAULT_CONFIG.maa.settleSec - 60 - 60
   })())
   T('非法 shutdownGraceSec 回退默认 5', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { shutdownGraceSec: -3 }); validateConfig(c, true); return c.shutdownGraceSec === 5
@@ -1066,7 +1126,7 @@ async function selfTest() {
   T('预算链负cap场景（ready=2000）→ 逐级回退，monitor 不为负', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { readyTimeoutSec: 2000 })
     validateConfig(c, true)
-    return c.readyTimeoutSec === 120 && c.monitorTimeoutSec >= 60 && c.monitorTimeoutSec <= 1500
+    return c.readyTimeoutSec === 120 && c.monitorTimeoutSec >= 60 && c.monitorTimeoutSec <= DEFAULT_CONFIG.monitorTimeoutSec
   })())
   T('slots 内 start>end → 整体回退默认双时段', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { window: { slots: [{ startHour: 5, endHour: 4 }] } })
@@ -1088,6 +1148,31 @@ async function selfTest() {
   T('portScan 被写成字符串 → 回退默认数组', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { maend: { portScan: '12701' } })
     validateConfig(c, true); return Array.isArray(c.maend.portScan) && c.maend.portScan.length === 10
+  })())
+
+  // 当日配额：记录解析与「仅成功计入」计数
+  T('ran: 旧单对象格式 → 视为 1 次已完成轮次（升级前语义不破坏）', (() => {
+    const runs = parseRanDoc(JSON.stringify({ boot: null, at: '2026-10-15T17:11:07', pid: 7936 }))
+    return runs.length === 1 && runs[0].ok === true && ranSucceededCount(runs) === 1
+  })())
+  T('ran: 新格式只统计 ok=true（失败/pending 不占额度）', (() => {
+    const runs = parseRanDoc(JSON.stringify({ runs: [{ ok: true }, { ok: false }, { ok: null }, { ok: true }] }))
+    return runs.length === 4 && ranSucceededCount(runs) === 2
+  })())
+  T('ran: 损坏内容 → 空列表（视为今日无成功记录，不误拦）', parseRanDoc('{oops').length === 0)
+  T('ran: null 内容 → 空列表', parseRanDoc('null').length === 0)
+  T('ran: 空 runs 数组 → 空列表', parseRanDoc(JSON.stringify({ runs: [] })).length === 0)
+  T('非法 window.dailyMaxRuns=0 → 回退默认 1', (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { window: { dailyMaxRuns: 0 } }); validateConfig(c, true); return c.window.dailyMaxRuns === 1
+  })())
+  T('非法 window.dailyMaxRuns=999（越界）→ 回退默认 1', (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { window: { dailyMaxRuns: 999 } }); validateConfig(c, true); return c.window.dailyMaxRuns === 1
+  })())
+  T('非整数 window.dailyMaxRuns=1.5 → 回退默认 1', (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { window: { dailyMaxRuns: 1.5 } }); validateConfig(c, true); return c.window.dailyMaxRuns === 1
+  })())
+  T('window.dailyMaxRuns=3 通过校验保留', (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { window: { dailyMaxRuns: 3 } }); validateConfig(c, true); return c.window.dailyMaxRuns === 3
   })())
 
   // MaaEnd 完成判定
@@ -1136,6 +1221,7 @@ async function windowTest() {
     slots: cfg.window.slots, nowGraceMin: cfg.window.nowGraceMin,
   })
   const pad = h => String(h).padStart(2, '0')
+  const ranRuns = readRanToday()
   console.log(JSON.stringify({
     now: now.toISOString(),
     lastBootUpTime_CIM: cim ? cim.toISOString() : null,
@@ -1147,7 +1233,13 @@ async function windowTest() {
     matchedSlotNowLimit: r.bootSlot ? r.bootSlotLimit.toISOString() : null,
     hitSlot: r.hitLabel,
     ageOk: r.ageOk,
-    ranToday: !!checkRanToday(),
+    ranToday: ranSucceededCount(ranRuns) >= cfg.window.dailyMaxRuns,
+    dailyQuota: {
+      limit: cfg.window.dailyMaxRuns,
+      succeeded: ranSucceededCount(ranRuns),
+      failed: ranRuns.filter(x => x.ok === false).length,
+      pending: ranRuns.filter(x => x.ok == null).length,
+    },
     inWindow: r.inWin,
   }, null, 2))
   await flushLog()
@@ -1219,14 +1311,16 @@ async function main() {
     ? '--force 跳过时间窗判定（dry-run 演练，不实际挂看门狗）'
     : '--force 跳过时间窗判定（安全语义不变，仍会挂看门狗）')
 
-  // ---- 当日执行配额（非 force、非 dry-run）：每个自然日至多完整执行一轮 ----
+  // ---- 当日执行配额（非 force、非 dry-run）：仅成功计入，至多 window.dailyMaxRuns 轮 ----
   if (!flags.force && !flags.dryRun) {
-    const ran = checkRanToday()
-    if (ran) {
-      log('WARN', 'window', `今日已于 ${ran.at || '?'} 完整执行过一轮（boot=${ran.boot || '?'}），静默退出；如需重跑请删除 state/ran-*.json 或使用 --force`)
+    const runs = readRanToday()
+    const succeeded = ranSucceededCount(runs)
+    if (succeeded >= cfg.window.dailyMaxRuns) {
+      const last = [...runs].reverse().find(r => r.ok === true)
+      log('WARN', 'quota', `今日已成功执行 ${succeeded}/${cfg.window.dailyMaxRuns} 轮（最近一次成功于 ${last?.at || '?'}），静默退出；如需重跑请删除 state/ran-*.json 或使用 --force`)
       await flushLog(); releaseLock(); return
     }
-    markRanToday(win.boot)
+    beginRan(win.boot)
   }
 
   // ---- 主流程（自此获得关机权限） ----
@@ -1238,8 +1332,9 @@ async function main() {
 
     if (flags.dryRun) {
       injectPostRunScript()
+      log('DRY ', 'launch', `[dry-run] 将启动: ${cfg.paths.maaExe}` +
+        (cfg.maa.settleSec > 0 ? `，并静置 ${cfg.maa.settleSec}s（等模拟器窗口稳定，避免焦点抢占干扰 MaaEnd）` : ''))
       if (cfg.game.enabled) log('DRY ', 'launch', `[dry-run] 将触发计划任务拉起游戏: ${cfg.game.taskName}（等待窗口就绪 ≤${cfg.game.readyTimeoutSec}s）`)
-      log('DRY ', 'launch', `[dry-run] 将启动: ${cfg.paths.maaExe}`)
       log('DRY ', 'launch', `[dry-run] 将启动: ${cfg.paths.maaendExe}`)
       log('DRY ', 'monitor', `[dry-run] 将轮询: MAA(flag+gui.log) / MaaEnd(12701-12710/api/maa/state + ws)，超时 ${cfg.monitorTimeoutSec}s`)
       outcome = { isError: false, stage: 'DRY_PLAN', startedAt: Date.now() }
