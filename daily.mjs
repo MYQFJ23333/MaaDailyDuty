@@ -235,6 +235,39 @@ function log(level, stage, msg) {
 }
 async function flushLog() { try { await logQueue } catch { /* ignore */ } }
 
+/**
+ * 解码子进程 stdout/stderr。中文 Windows 上 schtasks/powershell/tasklist/shutdown
+ * 输出为 GBK(CP936) 字节，Node 按 UTF-8 宽松解码会得到「ϵͳ�Ҳ…」乱码
+ * （2026-10-20 生产日志实锤）。策略：先严格 UTF-8(fatal)，抛错回退 gb18030（GBK 超集）。
+ * @param {Buffer|string|null|undefined} buf spawnSync 在 encoding:'buffer' 下的输出
+ */
+function dec(buf) {
+  if (buf == null) return ''
+  if (typeof buf === 'string') return buf // 兼容遗漏改 encoding 的调用点/测试
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf)
+  } catch {
+    try { return new TextDecoder('gb18030').decode(buf) }
+    catch { return buf.toString('utf8') } // ICU 缺失兜底（Node ≥13 自带 full-icu，实际不可达）
+  }
+}
+
+/** 运行间分隔：同一天第二次及以后运行，在上一段日志之后追加一个空行；
+ *  当日首跑（文件不存在）或空文件不加，避免文件开头空行。
+ *  必须把整个 stat+append 排进 logQueue：否则可能插队到锁阶段日志（如「清除陈旧锁」）之前。 */
+async function logBlankSeparator() {
+  logQueue = logQueue
+    .then(() => fsp.mkdir(LOG_DIR, { recursive: true }))
+    .then(async () => {
+      const p = logFileFor()
+      let size = -1
+      try { size = (await fsp.stat(p)).size } catch { /* ENOENT = 当日首跑 → 不加分隔 */ }
+      if (size > 0) await fsp.appendFile(p, '\n', 'utf8')
+    })
+    .catch(() => {})
+  await logQueue
+}
+
 function parseIsoStrict(s) {
   if (!s || s === 'NA') return null
   const m = String(s).match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(.*)$/)
@@ -250,9 +283,9 @@ function pidAlive(pid) {
 
 function isProcessRunning(name) {
   try {
-    const r = spawnSync('tasklist', ['/FI', `IMAGENAME eq ${name}`, '/NH'], { encoding: 'utf8', timeout: 10000 })
+    const r = spawnSync('tasklist', ['/FI', `IMAGENAME eq ${name}`, '/NH'], { encoding: 'buffer', timeout: 10000 })
     if (!r.error) {
-      const out = ((r.stdout || '') + (r.stderr || '')).toLowerCase()
+      const out = (dec(r.stdout) + dec(r.stderr)).toLowerCase()
       if (out.includes(name.toLowerCase())) return true
       if (out.trim()) return false // tasklist 正常给出了「无匹配」类输出
     }
@@ -262,9 +295,9 @@ function isProcessRunning(name) {
     const base = name.replace(/\.exe$/i, '')
     const r2 = spawnSync('powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command', `if (Get-Process -Name '${base}' -ErrorAction SilentlyContinue) { 'YES' } else { 'NO' }`],
-      { encoding: 'utf8', timeout: 10000 })
+      { encoding: 'buffer', timeout: 10000 })
     if (!r2.error && r2.status === 0) {
-      const t = String(r2.stdout || '').trim()
+      const t = dec(r2.stdout).trim()
       if (t.includes('YES')) return true
       if (t.includes('NO')) return false
     }
@@ -379,10 +412,10 @@ function getBootTimes() {
     "try{$b=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime;Write-Output ('CIM='+$b.ToString('o'))}catch{Write-Output 'CIM=NA'};" +
     "try{$e=(Get-WinEvent -FilterHashtable @{LogName='System';Id=6005} -MaxEvents 1).TimeCreated;Write-Output ('EVT='+$e.ToString('o'))}catch{Write-Output 'EVT=NA'}"
   const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
-    { encoding: 'utf8', timeout: 20000 })
+    { encoding: 'buffer', timeout: 20000 })
   const out = { cim: null, evt: null }
   if (r.error || r.status !== 0) return out
-  for (const line of String(r.stdout || '').split(/\r?\n/)) {
+  for (const line of dec(r.stdout).split(/\r?\n/)) {
     if (line.startsWith('CIM=')) out.cim = parseIsoStrict(line.slice(4).trim())
     if (line.startsWith('EVT=')) out.evt = parseIsoStrict(line.slice(4).trim())
   }
@@ -702,10 +735,10 @@ function armWatchdog() {
   if (flags.dryRun) { log('DRY ', 'watchdog', `[dry-run] 将先 shutdown /a 清除残留计划，再执行: shutdown ${args.join(' ')}`); return }
   // 先清残留：上一轮被硬杀遗留的看门狗 / 用户手动排程会导致本次 /s 返回 1115（若该语义存在），
   // 直接进错误路径会把「还剩30分钟的倒计时」变成「5秒后关机」——必须先 /a 再挂。
-  spawnSync('shutdown', ['/a'], { encoding: 'utf8', timeout: 15000 })
-  const r = spawnSync('shutdown', args, { encoding: 'utf8', timeout: 15000 })
+  spawnSync('shutdown', ['/a'], { encoding: 'buffer', timeout: 15000 })
+  const r = spawnSync('shutdown', args, { encoding: 'buffer', timeout: 15000 })
   if (r.error) throw new Error(`无法执行 shutdown: ${r.error.message}`)
-  if (r.status !== 0) throw new Error(`看门狗挂载失败 status=${r.status} stderr=${String(r.stderr || '').trim()}`)
+  if (r.status !== 0) throw new Error(`看门狗挂载失败 status=${r.status} stderr=${dec(r.stderr).trim()}`)
   watchdogArmed = true
   log('INFO', 'watchdog', `已挂载兜底看门狗：${cfg.watchdogSec}s 后自动关机`)
 }
@@ -714,23 +747,23 @@ function doShutdown() {
   const common = ['/s', '/t', String(cfg.shutdownGraceSec), '/d', 'p:4:1', '/f']
   // 先 /a：在「重复 /s 可覆盖」与「重复 /s 返回 1115 拒绝」两种未知语义下都正确；
   // /a 返回 1116（无挂起计划）属正常，忽略。
-  spawnSync('shutdown', ['/a'], { encoding: 'utf8', timeout: 15000 })
-  let r = spawnSync('shutdown', common, { encoding: 'utf8', timeout: 15000 })
+  spawnSync('shutdown', ['/a'], { encoding: 'buffer', timeout: 15000 })
+  let r = spawnSync('shutdown', common, { encoding: 'buffer', timeout: 15000 })
   let retried = false
   if (r.status !== 0) {
     retried = true
     sleepSync(1000)
-    spawnSync('shutdown', ['/a'], { encoding: 'utf8', timeout: 15000 })
-    r = spawnSync('shutdown', common, { encoding: 'utf8', timeout: 15000 })
+    spawnSync('shutdown', ['/a'], { encoding: 'buffer', timeout: 15000 })
+    r = spawnSync('shutdown', common, { encoding: 'buffer', timeout: 15000 })
   }
   // 兜底不变量：/a 已摧毁看门狗，若 /s 两次都没排上 → 重新挂看门狗，保证「要么已排程关机、要么看门狗仍在」
   let rearm = false
   if (r.status !== 0) {
-    const w = spawnSync('shutdown', ['/s', '/t', String(cfg.watchdogSec), '/f'], { encoding: 'utf8', timeout: 15000 })
+    const w = spawnSync('shutdown', ['/s', '/t', String(cfg.watchdogSec), '/f'], { encoding: 'buffer', timeout: 15000 })
     rearm = w.status === 0
     watchdogArmed = watchdogArmed || rearm
   }
-  return { status: r.status, retried, rearm, stderr: String(r.stderr || '').trim() }
+  return { status: r.status, retried, rearm, stderr: dec(r.stderr).trim() }
 }
 
 /* ============================== 错误处理接口（预留） ============================== */
@@ -758,7 +791,7 @@ async function runErrorHandlers(outcome) {
   if (cfg.onError.command) {
     try {
       const r = spawnSync(cfg.onError.command, cfg.onError.args || [], {
-        cwd: __dirname, encoding: 'utf8', shell: true,
+        cwd: __dirname, encoding: 'buffer', shell: true,
         timeout: cfg.onError.timeoutSec * 1000,
       })
       log('INFO', 'onError', `onError.command 退出码=${r.status}${r.error ? ` (${r.error.message})` : ''}`)
@@ -823,9 +856,9 @@ function gameWindowState() {
       "else { $p = $q | Where-Object { $_.MainWindowTitle } | Select-Object -First 1; " +
       "if ($p) { 'TITLE:' + $p.MainWindowTitle } else { 'RUNNOTITLE' } }"
     const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
-      { encoding: 'utf8', timeout: 10000 })
+      { encoding: 'buffer', timeout: 10000 })
     if (!r.error && r.status === 0) {
-      const t = String(r.stdout || '').trim()
+      const t = dec(r.stdout).trim()
       if (t.startsWith('TITLE:')) return { running: true, title: t.slice(6) }
       if (t === 'RUNNOTITLE') return { running: true, title: '' }
       if (t === 'NONE') return { running: false, title: '' }
@@ -852,8 +885,8 @@ async function ensureGameRunning() {
     log('INFO', 'launch', `游戏已在运行${st.title ? `（窗口: ${st.title}）` : ''}，复用`)
     return
   }
-  const r = spawnSync('schtasks', ['/Run', '/TN', cfg.game.taskName], { encoding: 'utf8', timeout: 15000 })
-  const out = ((r.stdout || '') + (r.stderr || '')).trim().replace(/\s+/g, ' ')
+  const r = spawnSync('schtasks', ['/Run', '/TN', cfg.game.taskName], { encoding: 'buffer', timeout: 15000 })
+  const out = (dec(r.stdout) + dec(r.stderr)).trim().replace(/\s+/g, ' ')
   if (r.error || r.status !== 0) {
     throw new Error(`触发游戏启动计划任务 ${cfg.game.taskName} 失败: ${r.error ? r.error.message : out || `exit ${r.status}`}`)
   }
@@ -1028,7 +1061,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     exiting = true
     if (watchdogArmed) {
       log('WARN', 'signal', `收到 ${sig}，手动中止：shutdown /a 取消本实例挂起的关机计划并退出`)
-      try { spawnSync('shutdown', ['/a'], { encoding: 'utf8', timeout: 15000 }) } catch { /* ignore */ }
+      try { spawnSync('shutdown', ['/a'], { encoding: 'buffer', timeout: 15000 }) } catch { /* ignore */ }
     } else {
       log('WARN', 'signal', `收到 ${sig}，手动中止退出（本实例未挂过关机计划，不执行 /a）`)
     }
@@ -1283,6 +1316,7 @@ async function main() {
   if (wtIdx >= 0) { await windowTest(); return }
 
   await acquireLock()
+  await logBlankSeparator()
   log('INFO', 'start', `脚本启动 pid=${process.pid} 参数=[${argv.join(' ') || '无'}] node=${process.version}`)
 
   // ---- 时间窗判定（多时段） ----

@@ -1,5 +1,4 @@
 # 运行时产物（按天产生，不入库）
-_research/
 logs/
 state/
 
