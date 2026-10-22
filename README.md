@@ -10,7 +10,7 @@
 - **自定义多时段触发**：开机时间落入任一时段即执行（默认凌晨 03–04 点与 07–08 点），时段可配 1–6 段。
 - **严格的窗口判定**：基于本次开机时间三重把关，窗口外运行只会静默退出——白天开机、晚登录、重复登录都不会误跑。
 - **关机看门狗兜底**：判定通过后先挂 1 小时兜底关机再启动任何程序，脚本崩溃也不会导致整夜开机。
-- **全自动拉起全链路**：MAA → 静置等模拟器窗口稳定 → 终末地（自动绕过 1.6+「须经官方启动器」校验）→ MaaEnd。
+- **全自动拉起全链路**：MAA → 静置等模拟器窗口稳定 → MaaEnd（终末地由 MaaEnd 拉起）。
 - **双通道完成检测**：MAA（回调 flag + 日志尾随）与 MaaEnd（HTTP 状态轮询 + WebSocket 加速）均确认完成后立即关机。
 - **每日成功配额**：每个自然日至多成功执行 `window.dailyMaxRuns` 轮（默认 2）。**仅成功计入**——失败/超时不占额度，下次开机落在时段内会自动重试；防止成功后关机再开机被反复执行。
 - **出错也关机**：启动失败/进程崩溃/监测超时/任务错误收尾 → 执行错误处理接口（可自定义告警）→ 依旧关机，不存在「出错后整夜裸奔」。
@@ -30,7 +30,7 @@
   ├─ 3. 挂看门狗：shutdown /a（清残留）→ shutdown /s /t 3600 /f
   ├─ 4. 向 MAA 配置注入「结束后脚本」回调（仅当该配置为空；自动备份+原子写入）
   ├─ 5. 启动 MAA.exe 并静置 30s（等模拟器窗口稳定，防焦点抢占）
-  │     → 经计划任务提权拉起终末地 → 启动 MaaEnd.exe → 等待双方就绪
+  │     → 启动 MaaEnd.exe（游戏由 MaaEnd 自行拉起）→ 等待双方就绪
   ├─ 6. 轮询监测至双方均完成（或出错/超时 → 错误路径）
   └─ 7. 收尾（幂等）
         正常：取消看门狗 → 5 秒后关机
@@ -63,14 +63,13 @@
 
 ```json
 "paths": {
-  "maaExe":     "D:\\Program Files\\MAA\\MAA.exe",
-  "maaConfig":  "D:\\Program Files\\MAA\\config\\gui.new.json",
-  "maaLog":     "D:\\Program Files\\MAA\\debug\\gui.log",
-  "maaendExe":  "D:\\Program Files\\MaaEnd\\MaaEnd.exe"
+  "maaDir":    "D:\\Program Files\\MAA",
+  "maaendDir": "D:\\Program Files\\MaaEnd",
+  "muMuDir":   "D:\\Program Files\\YXArkNights-12.0"
 }
 ```
 
-- `maaConfig` / `maaLog` 与 `maaExe` 同属 MAA 安装目录，跟随你的实际路径改。
+- 只需填三个安装目录：主程序、配置文件、日志、MuMuManager 等具体路径由程序按目录结构自动推导。
 - 触发时段在 `window.slots` 里改（须覆盖 BIOS 开机时间），全部配置项见下文[配置详解](#配置详解configjson)。
 - 改错了也不怕：非法值启动时自动回退默认并写 WARN 日志。
 
@@ -97,23 +96,12 @@ $trigger  = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERNAME" -Delay (New-
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 75) -StartWhenAvailable -AllowStartIfOnBatteries
 Register-ScheduledTask -TaskName "MaaDailyDuty" -Action $action -Trigger $trigger -Settings $settings -Force
-
-# ② 游戏启动任务：仅由 daily.mjs 经 schtasks /Run 触发，本身无自动触发器
-#    （终末地 1.6+ 校验父进程须为官方 Games.exe，需提权运行 launch-endfield.ps1）
-$psAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dir\launch-endfield.ps1`""
-$psPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -RunLevel Highest
-Register-ScheduledTask -TaskName "MDDLaunchGame" -Action $psAction -Principal $psPrincipal -Force
 ```
 
 要点：
 
-- 游戏安装路径与本机不同时，编辑 `launch-endfield.ps1` 顶部的 `$GameDir` / `$LauncherRoot` 默认参数
-  （或在计划任务的启动命令后追加 `-GameDir "..." -LauncherRoot "..."`）。
-- 游戏任务名必须与 `config.json → game.taskName` 一致（默认 `MDDLaunchGame`）。
 - 主控任务**不要**加 `--force` 参数（那是调试开关，会绕过时间窗与当日配额）。
-- 若不需要本项目代管游戏启动（例如你的终末地版本无父进程校验），设 `game.enabled=false` 即可跳过第 ② 步。
-- 检查任务状态：`Get-ScheduledTask MaaDailyDuty, MDDLaunchGame | Get-ScheduledTaskInfo`。
+- 检查任务状态：`Get-ScheduledTask MaaDailyDuty | Get-ScheduledTaskInfo`。
 
 ### 第 5 步：测试验证
 
@@ -130,10 +118,10 @@ node daily.mjs --dry-run --force # 3. 全链路演练：打印将执行的全部
 真机全流程验证（**会真的关机**，请确认可以关机时再做）：
 
 1. 临时改 `config.json`：`"watchdogSec": 3600`、`"monitorTimeoutSec": 2400`
-   （监测上限 40 分钟，看门狗 60 分钟硬兜底；预算链 cap=3120，不会触发 clamp WARN）；
+   （监测上限 40 分钟，看门狗 60 分钟硬兜底；预算链 cap=3300，不会触发 clamp WARN）；
 2. 临时改 `window.slots` 为单段且覆盖当前小时，如 `[{ "startHour": <当前小时>, "endHour": <当前小时+1> }]`；
 3. 运行 `node daily.mjs --force`（**必须带 --force**：绕过时间窗与当日成功配额）；
-4. 观察日志（`logs\daily-*.log`）：启动 MAA → 静置 → 拉起终末地 → 启动 MaaEnd → 心跳 → 双完成 → 关机；
+4. 观察日志（`logs\daily-*.log`）：启动 MAA → 静置 → 启动 MaaEnd（含拉起终末地）→ 心跳 → 双完成 → 关机；
 5. 测完**立即改回**正式配置，并删除测试产生的 `state\ran-*.json`。
 
 测试相关提示：
@@ -153,21 +141,19 @@ node daily.mjs --dry-run --force # 3. 全链路演练：打印将执行的全部
 | `window.slots` | `[{3,4},{7,8}]` | **触发时段（数组，1–6 段）**：`[{"startHour":3,"endHour":4},...]`，本次开机时间落入任一段（左闭右开）即触发。`start`∈0–23、`end`∈1–24、`start<end`；`end=24` 表示到次日零点，不支持跨零点段。非法则整组回退默认 |
 | `window.nowGraceMin` | 60 | 当前时刻上限 = 命中时段的 `endHour` + 此值（分钟）。开机后登录晚于此上限 → 静默退出（防白天误跑） |
 | `window.dailyMaxRuns` | 2 | 每日至多**成功**执行轮数（1–10）。仅成功计入：失败/超时/崩溃不占额度，下次开机落在时段内自动重试；成功次数达上限后同日重跑被静默拦下。非法回退内置值 1 |
-| `paths.maaExe` | `D:\Program Files\MAA\MAA.exe` | MAA 主程序路径 |
-| `paths.maaConfig` | `D:\Program Files\MAA\config\gui.new.json` | MAA 配置文件（注入「结束后脚本」回调的目标） |
-| `paths.maaLog` | `D:\Program Files\MAA\debug\gui.log` | MAA 日志（完成信号的第二通道） |
-| `paths.maaendExe` | `D:\Program Files\MaaEnd\MaaEnd.exe` | MaaEnd 主程序路径 |
+| `paths.maaDir` | `D:\Program Files\MAA` | MAA 安装目录。程序由此推导 `MAA.exe`、`config\gui.new.json`（注入回调目标）、`debug\gui.log`（完成信号第二通道） |
+| `paths.maaendDir` | `D:\Program Files\MaaEnd` | MaaEnd 安装目录。程序由此推导 `MaaEnd.exe` |
+| `paths.muMuDir` | `D:\Program Files\YXArkNights-12.0` | MuMu 模拟器安装目录。程序由此推导 `shell\MuMuManager.exe`（关闭模拟器的官方 CLI） |
+| `emulator.closeWhenMaaDone` | true | MAA 完成后立即用 MuMuManager 关闭模拟器释放内存（MAA 跑在模拟器里约十几分钟就结束，MaaEnd 是原生 PC 游戏不受影响；失败仅告警不阻断） |
+| `emulator.vmIndex` | 0 | MuMu 实例编号（MuMuManager 多开索引，0–99）。非法回退 0 |
 | `watchdogSec` | 3600 | 兜底关机（秒）。**是兜底不是正常路径**，不能设太短：Windows 关机前约 10 分钟会弹全屏提示，过短的看门狗会在任务仍在跑时弹出抢焦点、干扰 MaaEnd。日常实测总时长接近 1 小时再调大 |
-| `monitorTimeoutSec` | 1380 | 监测总时限（秒），超时 → 错误处理后关机。启动时强制满足预算链：`watchdog ≥ ready + gameReady + maaSettle + monitor + 2×onError + 60s`，越界自动 clamp 并 WARN |
+| `monitorTimeoutSec` | 1380 | 监测总时限（秒），超时 → 错误处理后关机。启动时强制满足预算链：`watchdog ≥ ready + maaSettle + monitor + 2×onError + 60s`，越界自动 clamp 并 WARN |
 | `readyTimeoutSec` | 120 | MAA / MaaEnd 启动就绪上限（秒；MaaEnd 端口探测也在其中） |
 | `maaReadyStableSec` | 5 | MAA 进程持续存活多久算启动成功（秒） |
 | `maa.settleSec` | 30 | 新启动 MAA 后的静置秒数：MAA 会拉起模拟器，其窗口弹出抢焦点会干扰随后启动的 MaaEnd，故先等窗口稳定（0=禁用；复用已在运行的 MAA 时跳过） |
 | `maa.injectPostRunScript` | true | 自动注入 MAA「结束后脚本」回调。要彻底移除注入改 `false`（仅删配置里的值会被下次运行重新注入） |
-| `maend.portScan` | `[12701..12710]` | MaaEnd web 端口探测范围（默认端口被占时自动回退试下一个） |
-| `maend.wsEnabled` | true | WebSocket `tasks-completed` 事件加速完成检测（Node ≥ 21 时生效，缺失自动降级纯轮询） |
-| `game.enabled` | true | 是否由本脚本拉起终末地（经提权计划任务，绕过 1.6+ 父进程校验）。设 `false` 则跳过，游戏需自行保证在运行 |
-| `game.taskName` | `MDDLaunchGame` | 拉起游戏用的计划任务名（须与第 4 步注册的任务名一致） |
-| `game.readyTimeoutSec` | 180 | 触发后等待游戏窗口就绪上限（秒，含提权编译与游戏启动耗时） |
+| `maaend.portScan` | `[12701..12710]` | MaaEnd web 端口探测范围（默认端口被占时自动回退试下一个） |
+| `maaend.wsEnabled` | true | WebSocket `tasks-completed` 事件加速完成检测（Node ≥ 21 时生效，缺失自动降级纯轮询） |
 | `shutdownGraceSec` | 5 | 关机前宽限秒数（给日志 flush；>0 时 shutdown 自动隐含 `/f`） |
 | `pollIntervalMs` | 2000 | 完成信号轮询间隔（毫秒） |
 | `heartbeatLogSec` | 60 | 监测心跳日志间隔（秒） |
@@ -190,9 +176,8 @@ node daily.mjs --maa-done      # MAA「结束后脚本」回调入口（内部�
 
 ## 错误处理接口
 
-进入错误路径的条件：看门狗挂载失败、exe 不存在、游戏拉起失败（计划任务未注册 / 就绪超时 /
-停在启动校验弹窗）、进程启动后立即退出、MaaEnd 端口超时、任一进程意外退出、监测超时、
-任务错误收尾（MAA「以下任务出现错误」/ MaaEnd `overall_status=Failed`）。
+进入错误路径的条件：看门狗挂载失败、exe 不存在、进程启动后立即退出、MaaEnd 端口超时、
+任一进程意外退出、监测超时、任务错误收尾（MAA「以下任务出现错误」/ MaaEnd `overall_status=Failed`）。
 
 出错后依次执行三层处理，**全部结束后无论结果如何都关机**：
 
@@ -212,7 +197,6 @@ node daily.mjs --maa-done      # MAA「结束后脚本」回调入口（内部�
 | `daily.mjs` | 主控脚本（唯一需要被计划任务调用的入口） |
 | `config.json` | 全部可调参数（缺失/损坏/非法时自动回退或修正默认值并记日志） |
 | `VERSION` | 当前版本号（纯文本，随发布更新） |
-| `launch-endfield.ps1` | 终末地 1.6+ 提权启动脚本（挂起创建官方 Games.exe 作父进程再拉起游戏） |
 | `errorHandler.example.mjs` | 错误处理接口示例，复制为 `errorHandler.mjs` 后生效 |
 | `logs\daily-YYYY-MM-DD.log` | 运行日志（UTF-8，按天切分，自动创建）——**排障第一依据** |
 | `state\lock.json` | 单实例锁（含时效校验，防重复运行） |
@@ -244,4 +228,3 @@ node daily.mjs --maa-done      # MAA「结束后脚本」回调入口（内部�
 ## 许可证
 
 本项目采用 [MIT 许可证](LICENSE) 开源，版权所有 © 2026 明月清风酱。
-`launch-endfield.ps1` 中的父进程创建技术移植自 Xel-Launcher 的 `ParentProcessLauncher.cs`（Apache-2.0）。

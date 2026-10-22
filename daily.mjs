@@ -5,7 +5,7 @@
  * 职责：
  *   1. 判断本次开机时间是否落在凌晨 [03:00, 04:00) 窗口（不在窗口则静默退出）
  *   2. 挂载 1 小时关机看门狗（防未知错误导致整夜开机；过短会在任务进行中弹系统关机提示抢焦点）
- *   3. 先启动 MAA.exe 并静置（等模拟器窗口稳定），再拉起终末地与 MaaEnd.exe，
+ *   3. 先启动 MAA.exe 并静置（等模拟器窗口稳定），再启动 MaaEnd.exe（终末地由 MaaEnd 自行拉起），
  *      监听双方「全部任务完成」信号
  *   4. 双方均完成 → 立即关机；任何错误 → 执行预留的错误处理接口 → 依旧关机
  *
@@ -53,14 +53,13 @@ const DEFAULT_CONFIG = {
     dailyMaxRuns: 1,  // 每日至多成功执行轮数。仅成功计入：失败/超时/崩溃不占额度，下次开机落在时段内自动重试
   },
   paths: {
-    maaExe: 'D:\\Program Files\\MAA\\MAA.exe',
-    maaConfig: 'D:\\Program Files\\MAA\\config\\gui.new.json',
-    maaLog: 'D:\\Program Files\\MAA\\debug\\gui.log',
-    maaendExe: 'D:\\Program Files\\MaaEnd\\MaaEnd.exe',
+    maaDir: 'D:\\Program Files\\MAA',          // MAA 安装目录
+    maaendDir: 'D:\\Program Files\\MaaEnd',     // MaaEnd 安装目录
+    muMuDir: 'D:\\Program Files\\YXArkNights-12.0', // MuMu 模拟器安装目录
   },
   watchdogSec: 3600,          // 判定通过后挂载的兜底关机（1 小时）。Windows 在关机前约 10 分钟会弹全屏提示，
                               // 30 分钟级看门狗会在任务仍在跑时弹出并抢焦点、干扰 MaaEnd——故兜底拉长到 1h
-  monitorTimeoutSec: 1380,    // 监测总时限；启动时会按预算链自动 clamp（ready+gameReady+maaSettle+monitor+2×onError+60s ≤ watchdogSec）
+  monitorTimeoutSec: 1380,    // 监测总时限；启动时会按预算链自动 clamp（ready+maaSettle+monitor+2×onError+60s ≤ watchdogSec）
   readyTimeoutSec: 120,       // 两进程启动就绪上限
   maaReadyStableSec: 5,       // MAA 进程持续存活多久算启动成功
   shutdownGraceSec: 5,        // 关机前宽限（>0 时 shutdown 自动隐含 /f）
@@ -69,19 +68,15 @@ const DEFAULT_CONFIG = {
   maa: {
     injectPostRunScript: true, // 启动 MAA 前自动注入「结束后脚本」回调（仅当该配置为空）
     settleSec: 30,             // 新启动 MAA 后的静置秒数：MAA 会拉起模拟器，其窗口弹出抢焦点会干扰
-                               // 随后启动的 MaaEnd 任务；先等窗口稳定再启动游戏与 MaaEnd（0=禁用；复用 MAA 时跳过）
+                               // 随后启动的 MaaEnd 任务；先等窗口稳定再启动 MaaEnd（0=禁用；复用 MAA 时跳过）
   },
-  maend: {
+  maaend: {
     portScan: [12701, 12702, 12703, 12704, 12705, 12706, 12707, 12708, 12709, 12710],
     wsEnabled: true,           // WebSocket tasks-completed 事件加速
   },
-  game: {
-    // 终末地 1.6+：U8SDK 校验 Endfield.exe 的父进程必须是官方 Games.exe，直启会弹「请通过官方启动器打开游戏」。
-    // 由计划任务（管理员权限）运行 launch-endfield.ps1：挂起创建官方 Games.exe 作父进程再拉起游戏。
-    // 计划任务注册需一次性管理员授权（schtasks /Create /RL HIGHEST）；日常触发 schtasks /Run 无需提权。
-    enabled: true,
-    taskName: 'MDDLaunchGame', // 触发游戏启动的计划任务名
-    readyTimeoutSec: 180,           // 触发后等待游戏窗口就绪上限（含提权脚本编译与游戏本体启动耗时）
+  emulator: {
+    closeWhenMaaDone: true,    // MAA 完成后立即关闭模拟器释放内存（MaaEnd 为原生 PC 游戏不受影响）
+    vmIndex: 0,                // MuMu 实例编号（MuMuManager 多开索引）
   },
   onError: {
     command: '',               // 例如 "powershell" args: ["-File", "C:\\...\\my-alert.ps1"]
@@ -111,6 +106,19 @@ function coerceSection(c, key, quiet = false) {
 }
 
 /**
+ * paths 段只需配置三个安装目录（maaDir / maaendDir / muMuDir），具体文件路径由此推导。
+ * 放在 validateConfig 末尾统一重算：整体回退默认后也保证派生键存在；
+ * 旧版 config 里残留的 maaExe/maaConfig/maaLog/maaendExe 会被无条件覆盖，无需迁移。
+ */
+function derivePaths(c) {
+  c.paths.maaExe = path.join(c.paths.maaDir, 'MAA.exe')
+  c.paths.maaConfig = path.join(c.paths.maaDir, 'config', 'gui.new.json')
+  c.paths.maaLog = path.join(c.paths.maaDir, 'debug', 'gui.log')
+  c.paths.maaendExe = path.join(c.paths.maaendDir, 'MaaEnd.exe')
+  c.paths.muMuManager = path.join(c.paths.muMuDir, 'shell', 'MuMuManager.exe')
+}
+
+/**
  * 数值字段校验 + 看门狗预算链收敛（防手改 config 笔误导致
  * 「关机命令失败→整夜开机」「预算为负→秒级误超时腰斩任务」「错误处理被看门狗抢断」）
  * quiet=true 供 --self-test 合成用例使用：合成 WARN 不写入当日生产日志，避免误导排障。
@@ -118,16 +126,20 @@ function coerceSection(c, key, quiet = false) {
 function validateConfig(c, quiet = false) {
   const W = (msg) => { if (!quiet) log('WARN', 'config', msg) }
   const E = (msg) => { if (!quiet) log('ERROR', 'config', msg) }
-  for (const k of ['window', 'paths', 'maa', 'maend', 'game', 'onError']) coerceSection(c, k, quiet)
-  if (!Array.isArray(c.maend.portScan) || c.maend.portScan.length === 0 ||
-      c.maend.portScan.some(p => !Number.isInteger(p) || p < 1 || p > 65535)) {
-    W(`maend.portScan=${JSON.stringify(c.maend.portScan)} 非法（须为非空端口数组），回退默认 12701-12710`)
-    c.maend.portScan = [...DEFAULT_CONFIG.maend.portScan]
+  for (const k of ['window', 'paths', 'maa', 'maaend', 'emulator', 'onError']) coerceSection(c, k, quiet)
+  if (!Array.isArray(c.maaend.portScan) || c.maaend.portScan.length === 0 ||
+      c.maaend.portScan.some(p => !Number.isInteger(p) || p < 1 || p > 65535)) {
+    W(`maaend.portScan=${JSON.stringify(c.maaend.portScan)} 非法（须为非空端口数组），回退默认 12701-12710`)
+    c.maaend.portScan = [...DEFAULT_CONFIG.maaend.portScan]
   }
   if (typeof c.onError.command !== 'string') { W('onError.command 不是字符串，置空'); c.onError.command = '' }
   if (!Array.isArray(c.onError.args)) { W(`onError.args=${JSON.stringify(c.onError.args)} 不是数组，置空`); c.onError.args = [] }
-  if (typeof c.game.enabled !== 'boolean') { W(`game.enabled=${JSON.stringify(c.game.enabled)} 非法，回退默认 true`); c.game.enabled = DEFAULT_CONFIG.game.enabled }
-  if (typeof c.game.taskName !== 'string' || !c.game.taskName.trim()) { W('game.taskName 非法（须为非空字符串），回退默认 MDDLaunchGame'); c.game.taskName = DEFAULT_CONFIG.game.taskName }
+  for (const k of ['maaDir', 'maaendDir', 'muMuDir']) {
+    if (typeof c.paths[k] !== 'string' || !c.paths[k].trim()) {
+      W(`paths.${k}=${JSON.stringify(c.paths[k])} 非法（须为非空目录字符串），回退默认值`)
+      c.paths[k] = DEFAULT_CONFIG.paths[k]
+    }
+  }
 
   const intOf = (v, dflt, min, max, key) => {
     if (typeof v !== 'number' || !Number.isFinite(v) || !Number.isInteger(v) || v < min || v > max) {
@@ -144,7 +156,7 @@ function validateConfig(c, quiet = false) {
   c.pollIntervalMs = intOf(c.pollIntervalMs, DEFAULT_CONFIG.pollIntervalMs, 500, 10000, 'pollIntervalMs')
   c.heartbeatLogSec = intOf(c.heartbeatLogSec, DEFAULT_CONFIG.heartbeatLogSec, 10, 3600, 'heartbeatLogSec')
   c.onError.timeoutSec = intOf(c.onError.timeoutSec, DEFAULT_CONFIG.onError.timeoutSec, 1, 600, 'onError.timeoutSec')
-  c.game.readyTimeoutSec = intOf(c.game.readyTimeoutSec, DEFAULT_CONFIG.game.readyTimeoutSec, 30, 600, 'game.readyTimeoutSec')
+  c.emulator.vmIndex = intOf(c.emulator.vmIndex, DEFAULT_CONFIG.emulator.vmIndex, 0, 99, 'emulator.vmIndex')
   c.window.nowGraceMin = intOf(c.window.nowGraceMin, DEFAULT_CONFIG.window.nowGraceMin, 0, 720, 'window.nowGraceMin')
   c.window.dailyMaxRuns = intOf(c.window.dailyMaxRuns, DEFAULT_CONFIG.window.dailyMaxRuns, 1, 10, 'window.dailyMaxRuns')
   const slotBad = s => !s || typeof s !== 'object' || Array.isArray(s) ||
@@ -159,19 +171,16 @@ function validateConfig(c, quiet = false) {
   delete c.window.startHour // 清理旧单窗口格式残留，避免误读
   delete c.window.endHour
 
-  // 预算链逐级收敛：cap = watchdog - ready - gameReady(启用时) - maaSettle(启用时) - 2×onError - 60s 余量，必须 ≥60。
-  // 任一级不满足就按 watchdog → ready → game.ready → onError 的顺序回退该项到默认（settle 不参与回退：
-  // 砍静置会复活「模拟器抢焦点」问题；默认组合 3600-120-180-30-60-60=3150 恒有解），
+  // 预算链逐级收敛：cap = watchdog - ready - maaSettle(启用时) - 2×onError - 60s 余量，必须 ≥60。
+  // 任一级不满足就按 watchdog → ready → onError 的顺序回退该项到默认（settle 不参与回退：
+  // 砍静置会复活「模拟器抢焦点」问题；默认组合 3600-120-30-60-60=3300 恒有解），
   // 彻底杜绝 cap 为负导致 monitorTimeoutSec 被 clamp 成「过去的时间 → 首轮即超时腰斩任务」。
-  const cap = () => c.watchdogSec - c.readyTimeoutSec - (c.game.enabled ? c.game.readyTimeoutSec : 0) - c.maa.settleSec - c.onError.timeoutSec * 2 - 60
+  const cap = () => c.watchdogSec - c.readyTimeoutSec - c.maa.settleSec - c.onError.timeoutSec * 2 - 60
   if (cap() < 60 && c.watchdogSec !== DEFAULT_CONFIG.watchdogSec) {
     W(`watchdogSec=${c.watchdogSec} 无法覆盖就绪+错误处理预算，回退默认 ${DEFAULT_CONFIG.watchdogSec}`); c.watchdogSec = DEFAULT_CONFIG.watchdogSec
   }
   if (cap() < 60 && c.readyTimeoutSec !== DEFAULT_CONFIG.readyTimeoutSec) {
     W(`readyTimeoutSec=${c.readyTimeoutSec} 挤占预算，回退默认 120`); c.readyTimeoutSec = DEFAULT_CONFIG.readyTimeoutSec
-  }
-  if (cap() < 60 && c.game.readyTimeoutSec !== DEFAULT_CONFIG.game.readyTimeoutSec) {
-    W(`game.readyTimeoutSec=${c.game.readyTimeoutSec} 挤占预算，回退默认 180`); c.game.readyTimeoutSec = DEFAULT_CONFIG.game.readyTimeoutSec
   }
   if (cap() < 60 && c.onError.timeoutSec !== DEFAULT_CONFIG.onError.timeoutSec) {
     W(`onError.timeoutSec=${c.onError.timeoutSec} 挤占预算，回退默认 30`); c.onError.timeoutSec = DEFAULT_CONFIG.onError.timeoutSec
@@ -180,7 +189,7 @@ function validateConfig(c, quiet = false) {
     // 默认组合仍有问题 → 配置已被深度改坏，整体回退默认
     E('配置组合无解（预算链），整体回退内置默认值')
     Object.assign(c, structuredClone(DEFAULT_CONFIG))
-    for (const k of ['window', 'paths', 'maa', 'maend', 'game', 'onError']) coerceSection(c, k, quiet)
+    for (const k of ['window', 'paths', 'maa', 'maaend', 'emulator', 'onError']) coerceSection(c, k, quiet)
   }
   c.monitorTimeoutSec = intOf(c.monitorTimeoutSec, DEFAULT_CONFIG.monitorTimeoutSec, 60, 86400, 'monitorTimeoutSec')
   if (c.monitorTimeoutSec > cap()) {
@@ -189,6 +198,8 @@ function validateConfig(c, quiet = false) {
   }
   // 终检：clamp 结果不得低于下界（防御任何未预见的组合）
   if (c.monitorTimeoutSec < 60) { c.monitorTimeoutSec = DEFAULT_CONFIG.monitorTimeoutSec; W(`monitorTimeoutSec 收敛异常，回退默认 ${DEFAULT_CONFIG.monitorTimeoutSec}`) }
+
+  derivePaths(c) // 必须放在最后：整体回退默认后也在此统一重算派生路径
 }
 
 function loadConfig() {
@@ -208,6 +219,7 @@ function loadConfig() {
     // validateConfig 自身异常（未预见的类型组合）→ 整体回退默认，绝不让配置问题炸掉主流程/自诊断
     log('ERROR', 'config', `配置校验异常，整体回退内置默认值：${e.message}`)
     cfg = structuredClone(DEFAULT_CONFIG)
+    derivePaths(cfg) // 该分支不经 validateConfig，手动补派生路径
   }
 }
 
@@ -477,11 +489,11 @@ function maaCallbackCmd() {
 
 /* ============================== 进程启动 ============================== */
 
-const exitInfo = { maa: null, maend: null }
-let maaChild = null, maendChild = null
+const exitInfo = { maa: null, maaend: null }
+let maaChild = null, maaendChild = null
 let maaSpawnAt = 0
 /** 进程被复用或为「启动器交接」时无可靠 exit 事件可挂 → 记标志，监测循环里周期性 tasklist 探活 */
-const reused = { maa: false, maend: false }
+const reused = { maa: false, maaend: false }
 
 function spawnApp(name, exe) {
   if (!fs.existsSync(exe)) throw new Error(`${name} 可执行文件不存在: ${exe}`)
@@ -501,12 +513,12 @@ function spawnApp(name, exe) {
     // 故其 exit 事件本身不代表应用死亡——以「是否仍有 MaaEnd.exe 进程存活」为真相：
     //   存活/未知 → 视同交接成功，转周期探活（同复用路径，真实应用崩溃由探活兜底）
     //   三次复核（间隔 1s）均确认不存在 → 才记为真实退出（启动失败仍能快速进错误路径）
-    if (name === 'maend') {
+    if (name === 'maaend') {
       for (let i = 0; i < 3; i++) {
         if (isProcessRunning('MaaEnd.exe') !== false) {
           log('INFO', 'proc', `MaaEnd 启动器进程已退出(code=${code})，真实应用仍在运行——转为周期探活`)
-          reused.maend = true
-          maendChild = null // stub PID 已无效，不再挂 exit 事件判定
+          reused.maaend = true
+          maaendChild = null // stub PID 已无效，不再挂 exit 事件判定
           return
         }
         if (i < 2) await sleep(1000)
@@ -525,7 +537,7 @@ function spawnApp(name, exe) {
 /* ============================== MaaEnd 端口与状态判定 ============================== */
 
 async function probeMaaEndPort() {
-  for (const p of cfg.maend.portScan) {
+  for (const p of cfg.maaend.portScan) {
     try {
       const r = await fetch(`http://127.0.0.1:${p}/api/interface`, { signal: AbortSignal.timeout(800) })
       const t = await r.text()
@@ -658,7 +670,7 @@ async function pollMaaEnd(trigger) {
 
 /* ---------- MaaEnd WebSocket 加速通道 ---------- */
 function startWs() {
-  if (!cfg.maend.wsEnabled || !maaEnd.port || finalized || wsObj) return
+  if (!cfg.maaend.wsEnabled || !maaEnd.port || finalized || wsObj) return
   try {
     const ws = new WebSocket(`ws://127.0.0.1:${maaEnd.port}/api/ws`)
     wsObj = ws
@@ -729,6 +741,8 @@ function injectPostRunScript() {
 
 /** 本实例是否挂起过关机计划（看门狗或最终关机）——Ctrl+C 是否执行 /a 的唯一依据 */
 let watchdogArmed = false
+/** 关闭模拟器是否已尝试过（每轮监测至多一次） */
+let emulatorCloseTried = false
 
 function armWatchdog() {
   const args = ['/s', '/t', String(cfg.watchdogSec), '/f']
@@ -764,6 +778,16 @@ function doShutdown() {
     watchdogArmed = watchdogArmed || rearm
   }
   return { status: r.status, retried, rearm, stderr: dec(r.stderr).trim() }
+}
+
+/** MAA 完成后关闭模拟器释放内存。MuMu 官方 CLI 优雅关机；失败仅告警，绝不阻断主流程/关机 */
+function closeEmulator() {
+  const t0 = Date.now()
+  const r = spawnSync(cfg.paths.muMuManager, ['control', '--vmindex', String(cfg.emulator.vmIndex), 'shutdown'],
+    { encoding: 'buffer', timeout: 30000 })
+  if (r.error) { log('WARN', 'emulator', `关闭模拟器失败: ${r.error.message}`); return }
+  if (r.status !== 0) { log('WARN', 'emulator', `关闭模拟器命令退出码=${r.status} ${dec(r.stderr).trim()}`); return }
+  log('INFO', 'emulator', `模拟器已关闭（MuMuManager shutdown，耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s）`)
 }
 
 /* ============================== 错误处理接口（预留） ============================== */
@@ -848,68 +872,6 @@ async function finalize(outcome) {
 
 /* ============================== 启动与就绪 ============================== */
 
-/** 读取 Endfield 进程存活与主窗口标题（弹窗检测用）。Get-Process 对提权进程的标题仍可读。 */
-function gameWindowState() {
-  try {
-    const ps = "$q = Get-Process -Name Endfield -ErrorAction SilentlyContinue; " +
-      "if (-not $q) { 'NONE' } " +
-      "else { $p = $q | Where-Object { $_.MainWindowTitle } | Select-Object -First 1; " +
-      "if ($p) { 'TITLE:' + $p.MainWindowTitle } else { 'RUNNOTITLE' } }"
-    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
-      { encoding: 'buffer', timeout: 10000 })
-    if (!r.error && r.status === 0) {
-      const t = dec(r.stdout).trim()
-      if (t.startsWith('TITLE:')) return { running: true, title: t.slice(6) }
-      if (t === 'RUNNOTITLE') return { running: true, title: '' }
-      if (t === 'NONE') return { running: false, title: '' }
-    }
-  } catch { /* fallthrough */ }
-  const fallback = isProcessRunning('Endfield.exe')
-  return { running: fallback === true, title: '' }
-}
-
-const GAME_POPUP_RE = /启动失败|官方启动器/
-
-/**
- * 确保游戏在运行（终末地 1.6+ 须经计划任务提权、以官方 Games.exe 为父进程拉起）。
- * 已运行则复用；若停留在校验弹窗则报错（无法自动处理弹窗态）。
- */
-async function ensureGameRunning() {
-  const running = isProcessRunning('Endfield.exe')
-  log('INFO', 'launch', `启动前进程检查：游戏=${running === null ? '未知' : running}`)
-  if (running === true) {
-    const st = gameWindowState()
-    if (st.title && GAME_POPUP_RE.test(st.title)) {
-      throw new Error(`已在运行的游戏停留在启动校验弹窗（窗口标题: ${st.title}），请先关闭游戏再重跑`)
-    }
-    log('INFO', 'launch', `游戏已在运行${st.title ? `（窗口: ${st.title}）` : ''}，复用`)
-    return
-  }
-  const r = spawnSync('schtasks', ['/Run', '/TN', cfg.game.taskName], { encoding: 'buffer', timeout: 15000 })
-  const out = (dec(r.stdout) + dec(r.stderr)).trim().replace(/\s+/g, ' ')
-  if (r.error || r.status !== 0) {
-    throw new Error(`触发游戏启动计划任务 ${cfg.game.taskName} 失败: ${r.error ? r.error.message : out || `exit ${r.status}`}`)
-  }
-  log('INFO', 'launch', `已触发计划任务 ${cfg.game.taskName} 提权拉起游戏（${out}）`)
-
-  const deadline = Date.now() + cfg.game.readyTimeoutSec * 1000
-  let sawProcess = false
-  while (Date.now() < deadline) {
-    const st = gameWindowState()
-    if (st.running) sawProcess = true
-    if (st.title && GAME_POPUP_RE.test(st.title)) {
-      throw new Error(`游戏弹出启动校验弹窗（窗口标题: ${st.title}）——计划任务方案失效或任务未以最高权限注册`)
-    }
-    if (st.running && /Endfield/i.test(st.title || '')) {
-      log('INFO', 'launch', `游戏窗口就绪（${st.title}）`)
-      return
-    }
-    await sleep(2000)
-  }
-  throw new Error(`游戏启动就绪超时(${cfg.game.readyTimeoutSec}s)：` +
-    (sawProcess ? '进程已出现但窗口未就绪（可能存在弹窗或启动器更新中）' : '进程未出现（计划任务触发失败？检查任务是否存在）'))
-}
-
 async function launchAndReady() {
   // exe 预检（路径不存在 → 错误路径）
   for (const [name, p] of [['MAA', cfg.paths.maaExe], ['MaaEnd', cfg.paths.maaendExe]]) {
@@ -942,7 +904,7 @@ async function launchAndReady() {
   }
 
   // MAA 静置：新启动的 MAA 会拉起模拟器，模拟器窗口弹出抢占焦点会干扰随后启动的 MaaEnd 任务；
-  // 先等窗口稳定（settleSec）再启动游戏与 MaaEnd。等待期间每秒探活，MAA 提前退出立即走错误路径
+  // 先等窗口稳定（settleSec）再启动 MaaEnd。等待期间每秒探活，MAA 提前退出立即走错误路径
   if (maaRunning === false && cfg.maa.settleSec > 0) {
     log('INFO', 'launch', `MAA 静置等待 ${cfg.maa.settleSec}s（等模拟器窗口稳定，避免焦点抢占干扰 MaaEnd）`)
     const settleUntil = Date.now() + cfg.maa.settleSec * 1000
@@ -952,16 +914,13 @@ async function launchAndReady() {
     }
   }
 
-  // 游戏在 MaaEnd 之前启动（1.6+ 须经计划任务提权拉起）；MaaEnd 的前置动作 skipIfRunning 会因游戏已在运行而跳过直启
-  if (cfg.game.enabled) await ensureGameRunning()
-
   const endRunning = isProcessRunning('MaaEnd.exe')
   log('INFO', 'launch', `启动前进程检查：MaaEnd=${endRunning === null ? '未知' : endRunning}`)
   if (endRunning === false) {
-    maendChild = spawnApp('maend', cfg.paths.maaendExe)
-    log('INFO', 'launch', `已启动 MaaEnd pid=${maendChild.pid}`)
+    maaendChild = spawnApp('maaend', cfg.paths.maaendExe)
+    log('INFO', 'launch', `已启动 MaaEnd pid=${maaendChild.pid}`)
   } else {
-    reused.maend = true
+    reused.maaend = true
     log(endRunning === null ? 'WARN' : 'INFO', 'launch', endRunning === null
       ? 'MaaEnd 进程状态检测失败（未知），不重复启动（防双开误判）；将以 web 端口探测判定真实状态'
       : '复用已在运行的 MaaEnd 进程（将以周期性进程探活替代退出事件）')
@@ -972,7 +931,7 @@ async function launchAndReady() {
   let maaStable = maaRunning === true // 复用进程视为已就绪
   while (Date.now() < deadline) {
     if (exitInfo.maa && maaChild) throw new Error(`MAA 启动后退出（code=${exitInfo.maa.code}）`)
-    if (exitInfo.maend && maendChild) throw new Error(`MaaEnd 启动后退出（code=${exitInfo.maend.code}）`)
+    if (exitInfo.maaend && maaendChild) throw new Error(`MaaEnd 启动后退出（code=${exitInfo.maaend.code}）`)
     if (!maaStable && maaChild && Date.now() - maaSpawnAt >= cfg.maaReadyStableSec * 1000) {
       maaStable = true
       log('INFO', 'ready', `MAA 进程存活 ${cfg.maaReadyStableSec}s，启动就绪`)
@@ -1004,13 +963,20 @@ async function monitorLoop() {
     tailMaaLog() // 不因 maa.done 停止：flag 之后到达的错误收尾行仍要能置 failed
     if (!maaEnd.done) await pollMaaEnd('poll')
 
+    // 1.5) MAA 完成且 MaaEnd 仍在跑 → 立即关闭模拟器释放内存（仅尝试一次，失败仅告警不阻断）。
+    //      MaaEnd 跑的终末地是原生 PC 游戏，不经模拟器；双方同轮完成时跳过（即将关机无需关）。
+    if (cfg.emulator.closeWhenMaaDone && maa.done && !maaEnd.done && !emulatorCloseTried) {
+      emulatorCloseTried = true
+      closeEmulator()
+    }
+
     // 2) 复用进程的周期性探活（每 ~10s；复用时无 exit 事件）
     if (Date.now() >= nextProcCheck) {
       nextProcCheck = Date.now() + 10000
       if (reused.maa && !maa.done && isProcessRunning('MAA.exe') === false) {
         return { isError: true, stage: 'MAA_EXIT', startedAt, err: new Error('复用的 MAA 进程已消失（崩溃或被手动关闭，未收到完成信号）') }
       }
-      if (reused.maend && !maaEnd.done && isProcessRunning('MaaEnd.exe') === false) {
+      if (reused.maaend && !maaEnd.done && isProcessRunning('MaaEnd.exe') === false) {
         return { isError: true, stage: 'MAAEND_EXIT', startedAt, err: new Error('复用的 MaaEnd 进程已消失（崩溃或被手动关闭，未收到完成信号）') }
       }
     }
@@ -1021,8 +987,8 @@ async function monitorLoop() {
     if (exitInfo.maa && maaChild && !maa.done) {
       return { isError: true, stage: 'MAA_EXIT', startedAt, err: new Error(`MAA 进程意外退出 code=${exitInfo.maa.code}（未收到完成信号）`) }
     }
-    if (exitInfo.maend && maendChild && !maaEnd.done) {
-      return { isError: true, stage: 'MAAEND_EXIT', startedAt, err: new Error(`MaaEnd 进程意外退出 code=${exitInfo.maend.code}（未收到完成信号）`) }
+    if (exitInfo.maaend && maaendChild && !maaEnd.done) {
+      return { isError: true, stage: 'MAAEND_EXIT', startedAt, err: new Error(`MaaEnd 进程意外退出 code=${exitInfo.maaend.code}（未收到完成信号）`) }
     }
 
     // 4) 双完成（含错误收尾定性）
@@ -1036,11 +1002,11 @@ async function monitorLoop() {
     // 5) 超时（放在信号之后：本轮刚到的完成信号优先于超时）
     if (Date.now() >= deadline) {
       return { isError: true, stage: 'MONITOR_TIMEOUT', startedAt,
-        err: new Error(`监测超时 ${cfg.monitorTimeoutSec}s：maa=${maa.done ? 'done' : 'wait'} maend=${maaEnd.done ? 'done' : 'wait'}`) }
+        err: new Error(`监测超时 ${cfg.monitorTimeoutSec}s：maa=${maa.done ? 'done' : 'wait'} maaend=${maaEnd.done ? 'done' : 'wait'}`) }
     }
 
     if (Date.now() >= nextHb) {
-      log('INFO', 'monitor', `心跳 maa=${maa.done ? 'done' : 'wait'}/${maa.via || '-'} maend=${maaEnd.done ? 'done' : 'wait'} port=${maaEnd.port || '-'} sawRunning=${maaEnd.sawRunning}`)
+      log('INFO', 'monitor', `心跳 maa=${maa.done ? 'done' : 'wait'}/${maa.via || '-'} maaend=${maaEnd.done ? 'done' : 'wait'} port=${maaEnd.port || '-'} sawRunning=${maaEnd.sawRunning}`)
       nextHb = Date.now() + cfg.heartbeatLogSec * 1000
     }
     await sleep(cfg.pollIntervalMs)
@@ -1143,9 +1109,9 @@ async function selfTest() {
   T('非法 maa.settleSec 回退默认 30', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { maa: { settleSec: -5 } }); validateConfig(c, true); return c.maa.settleSec === DEFAULT_CONFIG.maa.settleSec
   })())
-  T('预算链 clamp: watchdog=600 时 monitor 压到 150（游戏180+静置30+错误2×30）', (() => {
+  T('预算链 clamp: watchdog=600 时 monitor 压到 330（静置30+错误2×30）', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { watchdogSec: 600, monitorTimeoutSec: 1500 }); validateConfig(c, true)
-    return c.monitorTimeoutSec === 600 - 120 - 180 - DEFAULT_CONFIG.maa.settleSec - 60 - 60
+    return c.monitorTimeoutSec === 600 - 120 - DEFAULT_CONFIG.maa.settleSec - 60 - 60
   })())
   T('非法 shutdownGraceSec 回退默认 5', (() => {
     const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { shutdownGraceSec: -3 }); validateConfig(c, true); return c.shutdownGraceSec === 5
@@ -1179,8 +1145,44 @@ async function selfTest() {
     validateConfig(c, true); return c.window.slots.length === 3 && c.window.slots[2].startHour === 22
   })())
   T('portScan 被写成字符串 → 回退默认数组', (() => {
-    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { maend: { portScan: '12701' } })
-    validateConfig(c, true); return Array.isArray(c.maend.portScan) && c.maend.portScan.length === 10
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { maaend: { portScan: '12701' } })
+    validateConfig(c, true); return Array.isArray(c.maaend.portScan) && c.maaend.portScan.length === 10
+  })())
+  T('paths 只配目录 → 四项文件路径自动派生', (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { paths: { maaDir: 'E:\\MAA', maaendDir: 'E:\\MaaEnd' } })
+    validateConfig(c, true)
+    return c.paths.maaExe === path.join('E:\\MAA', 'MAA.exe') &&
+      c.paths.maaConfig === path.join('E:\\MAA', 'config', 'gui.new.json') &&
+      c.paths.maaLog === path.join('E:\\MAA', 'debug', 'gui.log') &&
+      c.paths.maaendExe === path.join('E:\\MaaEnd', 'MaaEnd.exe') &&
+      c.paths.muMuManager === path.join(DEFAULT_CONFIG.paths.muMuDir, 'shell', 'MuMuManager.exe')
+  })())
+  T('emulator 节被写成标量 → 整节回退默认对象', (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { emulator: 5 })
+    try { validateConfig(c, true) } catch { return false }
+    return c.emulator && typeof c.emulator === 'object' && c.emulator.vmIndex === 0 && c.emulator.closeWhenMaaDone === true
+  })())
+  T('非法 emulator.vmIndex（-1/字符串）→ 回退 0', (() => {
+    const a = mergeDeep(structuredClone(DEFAULT_CONFIG), { emulator: { vmIndex: -1 } }); validateConfig(a, true)
+    const b = mergeDeep(structuredClone(DEFAULT_CONFIG), { emulator: { vmIndex: 'x' } }); validateConfig(b, true)
+    return a.emulator.vmIndex === 0 && b.emulator.vmIndex === 0
+  })())
+  T('closeWhenMaaDone: false 保留（功能可关闭）', (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { emulator: { closeWhenMaaDone: false } })
+    validateConfig(c, true); return c.emulator.closeWhenMaaDone === false
+  })())
+  T('旧版 config 残留四项路径 → 被目录派生值无条件覆盖', (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), {
+      paths: { maaDir: 'E:\\MAA', maaendDir: 'E:\\MaaEnd', maaExe: 'C:\\old\\MAA.exe' },
+    })
+    validateConfig(c, true); return c.paths.maaExe === path.join('E:\\MAA', 'MAA.exe')
+  })())
+  T('paths.maaDir 写成空串/数字 → 回退默认目录并派生', (() => {
+    const c = mergeDeep(structuredClone(DEFAULT_CONFIG), { paths: { maaDir: '', maaendDir: 123 } })
+    try { validateConfig(c, true) } catch { return false }
+    return c.paths.maaDir === DEFAULT_CONFIG.paths.maaDir &&
+      c.paths.maaendDir === DEFAULT_CONFIG.paths.maaendDir &&
+      c.paths.maaExe === path.join(DEFAULT_CONFIG.paths.maaDir, 'MAA.exe')
   })())
 
   // 当日配额：记录解析与「仅成功计入」计数
@@ -1368,9 +1370,11 @@ async function main() {
       injectPostRunScript()
       log('DRY ', 'launch', `[dry-run] 将启动: ${cfg.paths.maaExe}` +
         (cfg.maa.settleSec > 0 ? `，并静置 ${cfg.maa.settleSec}s（等模拟器窗口稳定，避免焦点抢占干扰 MaaEnd）` : ''))
-      if (cfg.game.enabled) log('DRY ', 'launch', `[dry-run] 将触发计划任务拉起游戏: ${cfg.game.taskName}（等待窗口就绪 ≤${cfg.game.readyTimeoutSec}s）`)
-      log('DRY ', 'launch', `[dry-run] 将启动: ${cfg.paths.maaendExe}`)
+      log('DRY ', 'launch', `[dry-run] 将启动: ${cfg.paths.maaendExe}（终末地由 MaaEnd 自行拉起）`)
       log('DRY ', 'monitor', `[dry-run] 将轮询: MAA(flag+gui.log) / MaaEnd(12701-12710/api/maa/state + ws)，超时 ${cfg.monitorTimeoutSec}s`)
+      if (cfg.emulator.closeWhenMaaDone) {
+        log('DRY ', 'emulator', `[dry-run] MAA 完成后将执行: ${cfg.paths.muMuManager} control --vmindex ${cfg.emulator.vmIndex} shutdown`)
+      }
       outcome = { isError: false, stage: 'DRY_PLAN', startedAt: Date.now() }
     } else {
       // 2) 启动并就绪

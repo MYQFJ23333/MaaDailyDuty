@@ -8,14 +8,13 @@
     "dailyMaxRuns": 2
   },
   "paths": {
-    "maaExe": "D:\\Program Files\\MAA\\MAA.exe",
-    "maaConfig": "D:\\Program Files\\MAA\\config\\gui.new.json",
-    "maaLog": "D:\\Program Files\\MAA\\debug\\gui.log",
-    "maaendExe": "D:\\Program Files\\MaaEnd\\MaaEnd.exe"
+    "maaDir": "D:\\Program Files\\MAA",
+    "maaendDir": "D:\\Program Files\\MaaEnd",
+    "muMuDir": "D:\\Program Files\\YXArkNights-12.0"
   },
-  "watchdogSec": 3600,
-  "monitorTimeoutSec": 1800,
-  "readyTimeoutSec": 120,
+  "watchdogSec": 5400,
+  "monitorTimeoutSec": 5278,
+  "readyTimeoutSec": 30,
   "maaReadyStableSec": 5,
   "shutdownGraceSec": 5,
   "pollIntervalMs": 2000,
@@ -24,18 +23,17 @@
     "injectPostRunScript": true,
     "settleSec": 30
   },
-  "maend": {
+  "maaend": {
     "portScan": [12701, 12702, 12703, 12704, 12705, 12706, 12707, 12708, 12709, 12710],
     "wsEnabled": true
   },
-  "game": {
-    "enabled": true,
-    "taskName": "MDDLaunchGame",
-    "readyTimeoutSec": 180
+  "emulator": {
+    "closeWhenMaaDone": true,
+    "vmIndex": 0
   },
   "onError": {
     "command": "",
     "args": [],
-    "timeoutSec": 30
+    "timeoutSec": 1
   }
 }
